@@ -8,3 +8,4 @@ anthropic
 azure-search-documents
 azure-identity
 azure-storage-blob
+psycopg[binary]

@@ -13,9 +13,12 @@ from src.llm.azure_openai_client import (
 from src.config import (
     AZURE_MODEL_DEPLOYMENTS,
     AZURE_DEFAULT_MODEL,
+    DATABASE_URL,
     default_model_names,
     ordered_model_names,
 )
+from src.scoring.store import ScoringStore
+import psycopg
 from src.retrieval.rag import (
     build_retrieval_prompt,
     extract_timeline_from_document,
@@ -403,6 +406,23 @@ def extract_url(request: UrlRequest):
 @app.post("/api/extract-url")
 def extract_url_api(request: UrlRequest):
     return extract_url(request)
+
+
+@app.get("/rankings")
+def rankings():
+    """Return the published ranking from saved results. Never calls an AI model."""
+    try:
+        entries = ScoringStore(DATABASE_URL).latest_rankings()
+    except (ValueError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The ranking is temporarily unavailable.") from exc
+    if not entries:
+        raise HTTPException(status_code=404, detail="No ranking has been published yet.")
+    return {"rankings": entries}
+
+
+@app.get("/api/rankings")
+def rankings_api():
+    return rankings()
 
 
 @app.get("/{full_path:path}")
