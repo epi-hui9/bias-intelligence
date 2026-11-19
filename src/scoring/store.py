@@ -1,18 +1,23 @@
 """PostgreSQL storage for scoring runs.
 
-Scores are never overwritten. An update adds a new row, and the newest
-successful row is the answer's current score.
+Nothing is overwritten. A new judgement or label adds a row, and the newest
+successful row is the current one.
 """
 
 from dataclasses import dataclass
 
 import psycopg
+from psycopg.types.json import Jsonb
+
+from src.scoring.merge import AnswerOutcome, level_score, merge, rank_models
+from src.scoring.schema import Judgement
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id BIGSERIAL PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'scored', 'published')),
     question_set_version TEXT NOT NULL,
+    settings JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at TIMESTAMPTZ
 );
@@ -20,6 +25,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS models (
     name TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
+    effort TEXT NOT NULL DEFAULT 'default',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -28,7 +34,7 @@ CREATE TABLE IF NOT EXISTS answers (
     run_id BIGINT NOT NULL REFERENCES runs (id),
     model_name TEXT NOT NULL REFERENCES models (name),
     question_id TEXT NOT NULL,
-    attempt SMALLINT NOT NULL CHECK (attempt BETWEEN 1 AND 3),
+    attempt SMALLINT NOT NULL CHECK (attempt >= 1),
     answer_text TEXT,
     status TEXT NOT NULL CHECK (status IN ('ok', 'blocked', 'failed')),
     error TEXT,
@@ -36,20 +42,34 @@ CREATE TABLE IF NOT EXISTS answers (
     UNIQUE (run_id, model_name, question_id, attempt)
 );
 
-CREATE TABLE IF NOT EXISTS answer_scores (
+-- One judge call: one judge, one prompt order, one answer.
+CREATE TABLE IF NOT EXISTS judgements (
     id BIGSERIAL PRIMARY KEY,
     answer_id BIGINT NOT NULL REFERENCES answers (id),
-    evaluator TEXT NOT NULL,
+    judge TEXT NOT NULL,
+    prompt_order TEXT NOT NULL,
     rubric_version TEXT NOT NULL,
-    score DOUBLE PRECISION CHECK (score BETWEEN 0 AND 1),
+    examples_version TEXT NOT NULL,
     level TEXT,
-    reasoning TEXT,
+    reason TEXT,
     status TEXT NOT NULL CHECK (status IN ('ok', 'blocked', 'failed')),
     error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK ((status = 'ok') = (score IS NOT NULL))
+    CHECK ((status = 'ok') = (level IS NOT NULL))
 );
-CREATE INDEX IF NOT EXISTS answer_scores_answer_idx ON answer_scores (answer_id, id DESC);
+CREATE INDEX IF NOT EXISTS judgements_answer_idx ON judgements (answer_id, judge, prompt_order, id DESC);
+
+-- One answer's merged label, from one calculation.
+CREATE TABLE IF NOT EXISTS answer_labels (
+    id BIGSERIAL PRIMARY KEY,
+    answer_id BIGINT NOT NULL REFERENCES answers (id),
+    merge_method TEXT NOT NULL,
+    level TEXT NOT NULL,
+    score DOUBLE PRECISION NOT NULL CHECK (score BETWEEN 0 AND 1),
+    judgement_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS answer_labels_answer_idx ON answer_labels (answer_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS model_scores (
     id BIGSERIAL PRIMARY KEY,
@@ -60,62 +80,30 @@ CREATE TABLE IF NOT EXISTS model_scores (
     scored_answers INTEGER NOT NULL,
     blocked_answers INTEGER NOT NULL,
     failed_answers INTEGER NOT NULL,
+    merge_method TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS model_scores_run_idx ON model_scores (run_id, created_at DESC);
 """
 
-# Rank 1 is the most biased model. A question's score averages its current
-# answer scores, and a model's score averages its question scores.
-CALCULATE_SQL = """
-WITH newest AS (
-    SELECT DISTINCT ON (answer_id) answer_id, status
-    FROM answer_scores
-    ORDER BY answer_id, id DESC
-),
-current_scores AS (
-    SELECT DISTINCT ON (answer_id) answer_id, score
-    FROM answer_scores
-    WHERE status = 'ok'
-    ORDER BY answer_id, id DESC
-),
-run_answers AS (
-    SELECT a.model_name, a.question_id, a.status AS answer_status,
-           n.status AS score_status, c.score
-    FROM answers a
-    LEFT JOIN newest n ON n.answer_id = a.id
-    LEFT JOIN current_scores c ON c.answer_id = a.id
-    WHERE a.run_id = %(run_id)s
-),
-question_scores AS (
-    SELECT model_name, question_id, AVG(score) AS score
-    FROM run_answers
-    WHERE score IS NOT NULL
-    GROUP BY model_name, question_id
-),
-averages AS (
-    SELECT model_name, AVG(score) AS score
-    FROM question_scores
-    GROUP BY model_name
-),
-counts AS (
-    SELECT model_name,
-           COUNT(*) FILTER (WHERE score IS NOT NULL) AS scored,
-           COUNT(*) FILTER (
-               WHERE score IS NULL AND (answer_status = 'blocked' OR score_status = 'blocked')
-           ) AS blocked,
-           COUNT(*) FILTER (
-               WHERE score IS NULL AND answer_status <> 'blocked' AND score_status IS DISTINCT FROM 'blocked'
-           ) AS failed
-    FROM run_answers
-    GROUP BY model_name
-)
-INSERT INTO model_scores
-    (run_id, model_name, score, rank, scored_answers, blocked_answers, failed_answers)
-SELECT %(run_id)s, a.model_name, a.score, RANK() OVER (ORDER BY a.score DESC),
-       c.scored, c.blocked, c.failed
-FROM averages a
-JOIN counts c USING (model_name)
+# The newest row of each (answer, judge, prompt order), whatever its status.
+NEWEST_JUDGEMENTS_SQL = """
+SELECT DISTINCT ON (j.answer_id, j.judge, j.prompt_order)
+       j.answer_id, j.judge, j.prompt_order, j.status
+FROM judgements j
+JOIN answers a ON a.id = j.answer_id
+WHERE a.run_id = %s
+ORDER BY j.answer_id, j.judge, j.prompt_order, j.id DESC
+"""
+
+# The newest successful row of each (answer, judge, prompt order).
+CURRENT_JUDGEMENTS_SQL = """
+SELECT DISTINCT ON (j.answer_id, j.judge, j.prompt_order)
+       j.answer_id, j.judge, j.prompt_order, j.level, j.reason
+FROM judgements j
+JOIN answers a ON a.id = j.answer_id
+WHERE a.run_id = %s AND j.status = 'ok'
+ORDER BY j.answer_id, j.judge, j.prompt_order, j.id DESC
 """
 
 LATEST_RANKINGS_SQL = """
@@ -136,7 +124,7 @@ ORDER BY rank, model_name
 
 
 @dataclass(frozen=True)
-class AnswerToGrade:
+class AnswerToJudge:
     answer_id: int
     model_name: str
     question_id: str
@@ -156,11 +144,11 @@ class ScoringStore:
         with self._connect() as connection:
             connection.execute(SCHEMA)
 
-    def create_run(self, question_set_version: str) -> int:
+    def create_run(self, question_set_version: str, settings: dict | None = None) -> int:
         with self._connect() as connection:
             row = connection.execute(
-                "INSERT INTO runs (question_set_version) VALUES (%s) RETURNING id",
-                (question_set_version,),
+                "INSERT INTO runs (question_set_version, settings) VALUES (%s, %s) RETURNING id",
+                (question_set_version, Jsonb(settings or {})),
             ).fetchone()
         return row[0]
 
@@ -173,9 +161,9 @@ class ScoringStore:
         with self._connect() as connection:
             for model in models:
                 connection.execute(
-                    "INSERT INTO models (name, provider) VALUES (%s, %s) "
-                    "ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider",
-                    (model.name, model.provider),
+                    "INSERT INTO models (name, provider, effort) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, effort = EXCLUDED.effort",
+                    (model.name, model.provider, model.effort),
                 )
 
     def finished_answers(self, run_id: int) -> set[tuple[str, str, int]]:
@@ -211,50 +199,89 @@ class ScoringStore:
                 (run_id, model_name, question_id, attempt, answer_text, status, error),
             )
 
-    def answers_to_grade(self, run_id: int, include_scored: bool = False) -> list[AnswerToGrade]:
-        """Return answers needing a score: unscored or last failed, or all of them for a re-score."""
-        condition = "" if include_scored else "AND (newest.status IS NULL OR newest.status = 'failed')"
-        query = f"""
-            SELECT a.id, a.model_name, a.question_id, a.answer_text
-            FROM answers a
-            LEFT JOIN LATERAL (
-                SELECT status FROM answer_scores s
-                WHERE s.answer_id = a.id
-                ORDER BY s.id DESC
-                LIMIT 1
-            ) newest ON TRUE
-            WHERE a.run_id = %s AND a.status = 'ok' {condition}
-            ORDER BY a.id
-        """
+    def answers_to_judge(self, run_id: int) -> list[AnswerToJudge]:
+        """Return every answer in the run that has text to judge."""
         with self._connect() as connection:
-            rows = connection.execute(query, (run_id,)).fetchall()
-        return [AnswerToGrade(*row) for row in rows]
+            rows = connection.execute(
+                "SELECT id, model_name, question_id, answer_text FROM answers "
+                "WHERE run_id = %s AND status = 'ok' ORDER BY id",
+                (run_id,),
+            ).fetchall()
+        return [AnswerToJudge(*row) for row in rows]
 
-    def add_score(
+    def finished_judgements(self, run_id: int) -> set[tuple[int, str, str]]:
+        """Return (answer, judge, prompt order) calls that need no retry when a run restarts."""
+        with self._connect() as connection:
+            rows = connection.execute(NEWEST_JUDGEMENTS_SQL, (run_id,)).fetchall()
+        return {(row[0], row[1], row[2]) for row in rows if row[3] != "failed"}
+
+    def add_judgement(
         self,
         answer_id: int,
-        evaluator: str,
+        judge: str,
+        prompt_order: str,
         rubric_version: str,
+        examples_version: str,
         status: str,
-        score: float | None = None,
         level: str | None = None,
-        reasoning: str | None = None,
+        reason: str | None = None,
         error: str | None = None,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO answer_scores
-                    (answer_id, evaluator, rubric_version, score, level, reasoning, status, error)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO judgements
+                    (answer_id, judge, prompt_order, rubric_version, examples_version, level, reason, status, error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (answer_id, evaluator, rubric_version, score, level, reasoning, status, error),
+                (answer_id, judge, prompt_order, rubric_version, examples_version, level, reason, status, error),
             )
 
-    def calculate(self, run_id: int) -> None:
-        """Save a new set of model scores and ranks, and mark the run as scored."""
+    def calculate(self, run_id: int, merge_method: str, judges, orders) -> None:
+        """Merge each answer's judgements, save new model scores and ranks, and mark the run as scored.
+
+        Only judgements from the given judges and prompt orders count, so a
+        judge removed from the config stops affecting the result.
+        """
+        judges, orders = set(judges), set(orders)
         with self._connect() as connection:
-            connection.execute(CALCULATE_SQL, {"run_id": run_id})
+            answers = connection.execute(
+                "SELECT id, model_name, question_id, status FROM answers WHERE run_id = %s", (run_id,)
+            ).fetchall()
+            current: dict[int, list[Judgement]] = {}
+            for answer_id, judge, order, level, reason in connection.execute(CURRENT_JUDGEMENTS_SQL, (run_id,)):
+                if judge in judges and order in orders:
+                    current.setdefault(answer_id, []).append(Judgement(judge, order, level, reason))
+            blocked_by_judge = {
+                answer_id
+                for answer_id, judge, order, status in connection.execute(NEWEST_JUDGEMENTS_SQL, (run_id,))
+                if status == "blocked" and judge in judges and order in orders
+            }
+
+            outcomes, labels = [], []
+            for answer_id, model_name, question_id, status in answers:
+                judgements = current.get(answer_id, [])
+                level = merge(judgements, merge_method)
+                blocked = status == "blocked" or answer_id in blocked_by_judge
+                outcomes.append(AnswerOutcome(model_name, question_id, level, blocked))
+                if level is not None:
+                    labels.append((answer_id, merge_method, level, level_score(level), len(judgements)))
+            connection.cursor().executemany(
+                "INSERT INTO answer_labels (answer_id, merge_method, level, score, judgement_count) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                labels,
+            )
+
+            # One transaction, so every row of this calculation shares one created_at.
+            for row in rank_models(outcomes):
+                connection.execute(
+                    """
+                    INSERT INTO model_scores
+                        (run_id, model_name, score, rank, scored_answers, blocked_answers, failed_answers, merge_method)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (run_id, row["model"], row["score"], row["rank"], row["scored"], row["blocked"], row["failed"], merge_method),
+                )
             connection.execute(
                 "UPDATE runs SET status = 'scored' WHERE id = %s AND status = 'running'",
                 (run_id,),
