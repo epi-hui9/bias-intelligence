@@ -364,3 +364,8 @@ em { font-style: normal; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ----- logo ----- */
+.brand-logo { display: block; flex: none; }
+.brand { gap: 10px; }
+@media (max-width: 720px) { .brand-logo { width: 32px; height: 32px; } }

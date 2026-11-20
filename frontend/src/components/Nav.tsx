@@ -1,3 +1,4 @@
+import { LogoMark } from "./Logo";
 import type { Route } from "../lib/router";
 
 type Props = {
@@ -18,7 +19,7 @@ export function Nav({ route, hasEvidence, onOpenAbout, onOpenHome }: Props) {
     <header className="nav">
       <div className="container nav-row">
         <a className="brand" href="#top" onClick={() => onOpenHome("top")}>
-          <span className="brand-mark" aria-hidden />
+          <LogoMark size={38} className="brand-logo" />
           <span>Bias Intelligence</span>
         </a>
 
