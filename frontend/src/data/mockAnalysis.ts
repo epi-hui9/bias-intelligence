@@ -339,8 +339,8 @@ function aggregateCategoryScores(highlights: Highlight[]): CategoryScore[] {
 // AZURE_MODEL_DEPLOYMENTS_JSON in .env.example so it never shows a model
 // that isn't actually configured.
 export const DEFAULT_MODEL_NAMES = [
-  "GPT-5.5",
-  "Claude-Opus-4.6",
+  "GPT-6.2-Astra",
+  "Claude-Fable-5.2",
   "DeepSeek-V4-Pro",
   "Llama-3.3-70B-Instruct",
 ];

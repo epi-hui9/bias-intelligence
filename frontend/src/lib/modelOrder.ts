@@ -1,6 +1,6 @@
 import type { ModelAnalysis } from "./types";
 
-const MODEL_PREFIX_ORDER = ["gpt-5.5", "claude-opus", "deepseek", "llama"];
+const MODEL_PREFIX_ORDER = ["gpt-6.2", "claude-fable", "deepseek", "llama"];
 
 function modelPriority(name: string): number {
   const normalized = name.trim().toLowerCase();

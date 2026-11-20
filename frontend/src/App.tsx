@@ -10,6 +10,12 @@ import { mockAnalyzeModels, SAMPLE_TEXT } from "./data/mockAnalysis";
 import { analyzeText, extractPageText, fetchModelCatalog, pingApi } from "./lib/api";
 import { selectBalancedEvidence } from "./lib/evidence";
 import type { ApiStatus, ModelAnalysis } from "./lib/types";
+import { useRoute } from "./lib/router";
+import type { MergeKind } from "./data/leaderboard";
+import { RankingPage } from "./pages/RankingPage";
+import { ModelPage } from "./pages/ModelPage";
+import { QuestionPage, QuestionsPage } from "./pages/QuestionsPage";
+import { MethodPage } from "./pages/MethodPage";
 
 export default function App() {
   const initialModels = mockAnalyzeModels(SAMPLE_TEXT);
@@ -23,9 +29,8 @@ export default function App() {
     initialModels[0]?.result.highlights[0]?.id ?? null
   );
   const [apiStatus, setApiStatus] = useState<ApiStatus>("unknown");
-  const [view, setView] = useState<"home" | "about">(
-    () => (window.location.hash === "#about" ? "about" : "home")
-  );
+  const route = useRoute();
+  const [merge, setMerge] = useState<MergeKind>("vote");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [analysisState, setAnalysisState] = useState<
@@ -101,12 +106,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const handleHashChange = () => {
-      setView(window.location.hash === "#about" ? "about" : "home");
-    };
-    window.addEventListener("hashchange", handleHashChange);
-    return () => window.removeEventListener("hashchange", handleHashChange);
-  }, []);
+    if (route.name !== "home") window.scrollTo({ top: 0 });
+  }, [route]);
 
   useEffect(() => {
     if (
@@ -252,13 +253,10 @@ export default function App() {
 
   function openAbout() {
     window.location.hash = "about";
-    setView("about");
-    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function openHome(target = "top") {
     window.location.hash = target;
-    setView("home");
     requestAnimationFrame(() => {
       document.getElementById(target)?.scrollIntoView({ behavior: "smooth" });
     });
@@ -267,16 +265,26 @@ export default function App() {
   return (
     <>
       <Nav
-        view={view}
+        route={route.name}
         hasEvidence={activeEvidence.length > 0}
         onOpenAbout={openAbout}
         onOpenHome={openHome}
       />
 
-      {view === "about" ? (
+      {route.name === "about" ? (
         <main>
           <About onStart={() => openHome("workspace")} />
         </main>
+      ) : route.name === "ranking" ? (
+        <main><RankingPage merge={merge} setMerge={setMerge} /></main>
+      ) : route.name === "model" ? (
+        <main><ModelPage id={route.id} merge={merge} setMerge={setMerge} /></main>
+      ) : route.name === "questions" ? (
+        <main><QuestionsPage /></main>
+      ) : route.name === "question" ? (
+        <main><QuestionPage id={route.id} merge={merge} setMerge={setMerge} /></main>
+      ) : route.name === "method" ? (
+        <main><MethodPage /></main>
       ) : (
       <main>
         <Hero onAnalyze={scrollToWorkspace} />

@@ -42,8 +42,8 @@ export function About({ onStart }: Props) {
             <h2>Keep judgment human</h2>
             <p>
               Automated analysis can surface a question. People remain responsible for moral
-              judgment, deeper understanding, and how they act toward one
-              another.
+              judgment, deeper understanding, and how they treat
+              each other.
             </p>
           </article>
         </div>

@@ -1,11 +1,19 @@
+import type { Route } from "../lib/router";
+
 type Props = {
-  view: "home" | "about";
+  route: Route["name"];
   hasEvidence: boolean;
   onOpenAbout: () => void;
   onOpenHome: (target?: string) => void;
 };
 
-export function Nav({ view, hasEvidence, onOpenAbout, onOpenHome }: Props) {
+const LINKS: { name: Route["name"][]; href: string; label: string }[] = [
+  { name: ["ranking", "model"], href: "#/ranking", label: "Ranking" },
+  { name: ["questions", "question"], href: "#/questions", label: "Questions" },
+  { name: ["method"], href: "#/method", label: "Method" },
+];
+
+export function Nav({ route, hasEvidence, onOpenAbout, onOpenHome }: Props) {
   return (
     <header className="nav">
       <div className="container nav-row">
@@ -15,19 +23,16 @@ export function Nav({ view, hasEvidence, onOpenAbout, onOpenHome }: Props) {
         </a>
 
         <nav className="nav-links" aria-label="Primary">
-          {view === "home" ? (
-            <>
-              <a href="#workspace">Analyze</a>
-              {hasEvidence && <a href="#social-evidence">Evidence</a>}
-            </>
-          ) : (
-            <a href="#top" onClick={() => onOpenHome("top")}>Home</a>
-          )}
-          <a
-            href="#about"
-            aria-current={view === "about" ? "page" : undefined}
-            onClick={onOpenAbout}
-          >
+          {LINKS.map((l) => (
+            <a key={l.href} href={l.href} aria-current={l.name.includes(route) ? "page" : undefined}>
+              {l.label}
+            </a>
+          ))}
+          <a className="nav-cta" href="#workspace" aria-current={route === "home" ? "page" : undefined} onClick={() => onOpenHome("workspace")}>
+            Writing tool
+          </a>
+          {route === "home" && hasEvidence && <a className="nav-extra" href="#social-evidence">Evidence</a>}
+          <a href="#about" aria-current={route === "about" ? "page" : undefined} onClick={onOpenAbout}>
             About
           </a>
         </nav>

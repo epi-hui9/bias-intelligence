@@ -3,6 +3,7 @@ import type { AnalysisResult, ModelAnalysis } from "../lib/types";
 import { HighlightedText } from "./HighlightedText";
 import { Check, Pencil, Reload, Sparkle } from "./Icons";
 import { biasLevel } from "../lib/biasLevel";
+import { ModelLogo } from "./ModelLogo";
 
 type Props = {
   analysis: AnalysisResult;
@@ -209,7 +210,10 @@ export function Workspace({
                         >
                           <div className="model-card-face">
                             <div className="model-score-meta">
-                              <span className="model-score-name">{model.model}</span>
+                              <span className="model-score-id">
+                                <ModelLogo name={model.model} size={28} />
+                                <span className="model-score-name">{model.model}</span>
+                              </span>
                               <span className="model-score-value">
                                 {model.overallScore.toFixed(2)}
                               </span>

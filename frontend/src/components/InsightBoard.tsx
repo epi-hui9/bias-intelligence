@@ -5,6 +5,7 @@ import { DimensionsBars } from "./DimensionsBars";
 import { SurveyQuestion } from "./SurveyQuestion";
 import { TimelineChart } from "./TimelineChart";
 import { biasLevel } from "../lib/biasLevel";
+import { ModelLogo } from "./ModelLogo";
 
 type Props = {
   highlight: Highlight | null;
@@ -80,17 +81,11 @@ export function InsightBoard({ highlight, models, activeModelIndex, onModelSelec
             {modelsWithPhrase.map(({ model: m, index: i }) => (
               <button
                 key={m.model}
+                type="button"
+                className={`ib-model${i === activeModelIndex ? " is-active" : ""}`}
                 onClick={() => onModelSelect(i)}
-                style={{
-                  padding: "6px 12px",
-                  borderRadius: 999,
-                  border: i === activeModelIndex ? "1px solid var(--accent-warm)" : "1px solid rgba(255,255,255,0.15)",
-                  background: i === activeModelIndex ? "rgba(255,255,255,0.08)" : "transparent",
-                  color: "var(--fg)",
-                  fontSize: 13,
-                  cursor: "pointer",
-                }}
               >
+                <ModelLogo name={m.model} size={22} tone="dark" />
                 {m.model}
               </button>
             ))}
@@ -114,10 +109,10 @@ export function InsightBoard({ highlight, models, activeModelIndex, onModelSelec
       <div className="insight-board-body">
         <div className="insight-board-col">
           <div className="insight-board-block">
-            <div className="insight-board-h">What we noticed</div>
+            <div className="insight-board-h">What stands out</div>
             <p className="insight-board-text">
               {highlight.explanation ||
-                "The selected signal has no explanation yet. Try another model or analyze the text again."}
+                "The selected signal has no explanation yet. Try a different model or analyze the text again."}
             </p>
           </div>
 

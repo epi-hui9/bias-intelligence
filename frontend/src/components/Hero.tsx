@@ -1,4 +1,6 @@
 import { ArrowRight } from "./Icons";
+import { ModelLogo } from "./ModelLogo";
+import { PROVIDERS } from "../data/leaderboard";
 
 type Props = {
   onAnalyze: () => void;
@@ -7,8 +9,10 @@ type Props = {
 export function Hero({ onAnalyze }: Props) {
   return (
     <section className="hero" id="top">
+      <div className="hero-glow" aria-hidden />
       <div className="container hero-grid">
         <div>
+          <span className="section-eyebrow">Humanity and Technoscience Lab</span>
           <h1>
             Neutral words can leave <em>our assumptions untouched.</em>
           </h1>
@@ -20,11 +24,17 @@ export function Hero({ onAnalyze }: Props) {
           </p>
 
           <div className="hero-cta">
-            <button className="btn btn-accent" onClick={onAnalyze}>
+            <button className="btn btn-accent btn-lg" onClick={onAnalyze}>
               Start analysis <ArrowRight size={16} />
             </button>
+            <a className="btn btn-ghost btn-lg" href="#/ranking">See the model ranking</a>
           </div>
 
+          <div className="hero-logos" aria-label="Providers compared">
+            {PROVIDERS.map((p) => (
+              <span key={p.key} title={p.name}><ModelLogo provider={p.key} size={34} /></span>
+            ))}
+          </div>
         </div>
 
         <div className="preview">

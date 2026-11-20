@@ -127,3 +127,26 @@ human-facing label in the frontend (do not surface the raw key).
 
 Both live at the root of `frontend/`. Vite does not serve them by default;
 open them directly in the browser if needed.
+
+## Fall 2026 additions
+
+The writing tool above is unchanged in behavior. New pages share its design system and live under `src/pages/`:
+
+- `RankingPage`: public ranking with podium, provider strip, merge rule switch, category filter, and rank shifts
+- `ModelPage`: score ring, category bars, judge votes, disagreements, paired questions, question heat map
+- `QuestionsPage` and `QuestionPage`: all questions, and every model's answers with the nine votes and reasons
+- `MethodPage`: interactive nine-votes explainer, rubric, scoring, failure handling
+
+Routing is hash based (`src/lib/router.ts`): `#/ranking`, `#/models/:id`, `#/questions`, `#/questions/:id`, `#/method`.
+All leaderboard values are seeded sample data in `src/data/leaderboard.ts`. Replace them with the real API calls.
+Provider logos come from `@lobehub/icons-static-svg` and are inlined in `src/lib/logoSvg.ts`.
+
+```bash
+npm install
+npm run dev            # development
+npm run build:single   # one self-contained HTML file in dist-single/
+```
+
+## Preview without installing
+
+`preview/index.html` is a self-contained build of the current frontend (sample data). Open it through the link in the pull request or branch description.
