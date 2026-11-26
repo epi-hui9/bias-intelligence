@@ -35,3 +35,9 @@ data/processed
 .DS_Store
 Thumbs.db
 *.log
+
+# Local PostgreSQL for testing
+.pgdata
+
+# Scoring run exports
+exports

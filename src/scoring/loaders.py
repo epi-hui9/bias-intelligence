@@ -1,8 +1,8 @@
 """Load the scoring materials and hand the engine one checked `Materials`.
 
 A loader only reads a source and returns the data as written. `load_materials`
-then applies the same clean-up and checks whatever the source was. To read from
-Azure later, write one more loader function and add it to `LOADERS`.
+then applies the same clean-up and checks whatever the source was. To add a
+source, write one more loader function and add it to `LOADERS`.
 """
 
 import csv
@@ -10,7 +10,8 @@ import hashlib
 from collections.abc import Callable
 from pathlib import Path
 
-from src.scoring import config
+from src.config import DATABASE_URL
+from src.scoring import config, materials_db
 from src.scoring.schema import LEVELS, Example, Materials, Question, RubricRow
 
 INPUTS_DIR = Path(__file__).resolve().parent.parent / "data" / "scoring_inputs"
@@ -31,7 +32,6 @@ def load_from_disk(directory: Path = INPUTS_DIR) -> Materials:
     """Read the three CSV files in `src/data/scoring_inputs`."""
     questions_path = directory / config.QUESTIONS_FILE
     rubric_path = directory / config.RUBRIC_FILE
-    examples_path = directory / config.EXAMPLES_FILE
 
     questions = [
         Question(row["id"].strip(), row["category"].strip(), row["type"].strip(), row["prompt"].strip())
@@ -44,28 +44,86 @@ def load_from_disk(directory: Path = INPUTS_DIR) -> Materials:
         )
         for row in _read_rows(rubric_path)
     }
-
-    # The examples file is a Notion export. Notion names the first column after
-    # a sample sentence, so the example text is read by position, not by name.
-    with examples_path.open(newline="", encoding="utf-8-sig") as handle:
-        header, *rows = list(csv.reader(handle))
-    level_at, category_at, status_at = (header.index(name) for name in ("Bias Level", "Category", "Status"))
-    examples = [
-        Example(row[category_at].strip(), row[level_at].strip(), row[0].strip())
-        for row in rows
-        # Rows without a category or level are notes, not examples.
-        if row[category_at].strip() and row[level_at].strip() and row[status_at].strip() in config.EXAMPLE_STATUSES
-    ]
-
+    examples, examples_version = _read_examples(directory)
     versions = {
         "questions": file_version(questions_path),
         "rubric": file_version(rubric_path),
-        "examples": file_version(examples_path),
+        "examples": examples_version,
     }
     return Materials(questions, rubric, examples, versions)
 
 
-LOADERS: dict[str, Callable[[], Materials]] = {"disk": load_from_disk}
+def _example_rows(directory: Path) -> list[dict[str, str]]:
+    """Every example in the file, whatever its status, in file order."""
+    # The examples file is a Notion export. Notion names the first column after
+    # a sample sentence, so the example text is read by position, not by name.
+    with (directory / config.EXAMPLES_FILE).open(newline="", encoding="utf-8-sig") as handle:
+        header, *rows = list(csv.reader(handle))
+    names = ("Bias Level", "Category", "Status", "Contributor", "Source")
+    level_at, category_at, status_at, contributor_at, source_at = (header.index(name) for name in names)
+    return [
+        {
+            "position": position,
+            "category": row[category_at].strip(),
+            "level": row[level_at].strip(),
+            "text": row[0].strip(),
+            "status": row[status_at].strip(),
+            "contributor": row[contributor_at].strip(),
+            "source": row[source_at].strip(),
+        }
+        for position, row in enumerate(rows, start=1)
+        # Rows without a category or level are notes, not examples.
+        if row[category_at].strip() and row[level_at].strip()
+    ]
+
+
+def _read_examples(directory: Path) -> tuple[list[Example], str]:
+    examples = [
+        Example(row["category"], row["level"], row["text"])
+        for row in _example_rows(directory)
+        if row["status"] in config.EXAMPLE_STATUSES
+    ]
+    return examples, file_version(directory / config.EXAMPLES_FILE)
+
+
+def sql_versions() -> dict[str, str]:
+    """The version names in SQL: each configured file's name without .csv."""
+    return {
+        "questions": Path(config.QUESTIONS_FILE).stem,
+        "rubric": Path(config.RUBRIC_FILE).stem,
+        "examples": Path(config.EXAMPLES_FILE).stem,
+    }
+
+
+def load_from_sql(database_url: str | None = None) -> Materials:
+    """Read the questions, rubric and examples from PostgreSQL."""
+    questions, rubric, examples, versions = materials_db.read_materials(
+        database_url or DATABASE_URL, sql_versions(), config.EXAMPLE_STATUSES
+    )
+    return Materials(questions, rubric, examples, versions)
+
+
+def import_from_disk(database_url: str, directory: Path = INPUTS_DIR) -> dict[str, str]:
+    """Copy the configured files into SQL, once they pass the checks."""
+    raw = load_from_disk(directory)
+    prepare(raw)
+    rename = lambda category: config.CATEGORY_ALIASES.get(category, category)
+    sources = [row.get("source", "").strip() for row in _read_rows(directory / config.QUESTIONS_FILE)]
+    questions = [
+        (q.id, position, rename(q.category), q.type, q.prompt, source)
+        for position, (q, source) in enumerate(zip(raw.questions, sources, strict=True), start=1)
+    ]
+    rubric = [
+        (row.category, level, description) for row in raw.rubric.values() for level, description in row.levels.items()
+    ]
+    fields = ("position", "category", "level", "text", "status", "contributor", "source")
+    examples = [
+        tuple(rename(row[f]) if f == "category" else row[f] for f in fields) for row in _example_rows(directory)
+    ]
+    return materials_db.import_materials(database_url, sql_versions(), questions, rubric, examples)
+
+
+LOADERS: dict[str, Callable[[], Materials]] = {"disk": load_from_disk, "sql": load_from_sql}
 
 
 def prepare(

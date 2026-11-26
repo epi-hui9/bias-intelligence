@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -17,7 +18,7 @@ from src.config import (
     default_model_names,
     ordered_model_names,
 )
-from src.scoring.store import ScoringStore
+from src.scoring.store import LogStore, SqlLog
 import psycopg
 from src.retrieval.rag import (
     build_retrieval_prompt,
@@ -41,6 +42,15 @@ import ipaddress
 import socket
 
 app = FastAPI(title="Latimer AI Bias Backend")
+
+# The website on GitHub Pages reads this API from another address, which browsers
+# block unless that address is allowed here. Read-only: GET requests only.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "https://epi-hui9.github.io").split(",")
+    if origin.strip()
+]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET"])
 
 ANALYZE_RETRIEVAL_CACHE_TTL_SECONDS = int(os.getenv("ANALYZE_RETRIEVAL_CACHE_TTL_SECONDS", "900"))
 ANALYZE_EVIDENCE_POOL_SIZE = int(os.getenv("ANALYZE_EVIDENCE_POOL_SIZE", "32"))
@@ -410,14 +420,14 @@ def extract_url_api(request: UrlRequest):
 
 @app.get("/rankings")
 def rankings():
-    """Return the published ranking from saved results. Never calls an AI model."""
+    """Return everything the ranking website shows, from saved results. Never calls an AI model."""
     try:
-        entries = ScoringStore(DATABASE_URL).latest_rankings()
+        ranking = LogStore(SqlLog(DATABASE_URL)).published_ranking()
     except (ValueError, psycopg.Error) as exc:
         raise HTTPException(status_code=503, detail="The ranking is temporarily unavailable.") from exc
-    if not entries:
+    if ranking is None:
         raise HTTPException(status_code=404, detail="No ranking has been published yet.")
-    return {"rankings": entries}
+    return ranking
 
 
 @app.get("/api/rankings")

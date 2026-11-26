@@ -1,137 +1,158 @@
-"""PostgreSQL storage for scoring runs.
+"""Storage for scoring runs: one append-only log of rows.
 
-Nothing is overwritten. A new judgement or label adds a row, and the newest
-successful row is the current one.
+The log lives in one of two places. Both hold the same rows, and the same
+logic in `LogStore` reads and writes them:
+
+    SqlLog  the `log` table in PostgreSQL. Runs on Azure use it.
+    CsvLog  one CSV file per run on this computer, exports/run_<id>.csv.
+            `--debug` runs use it, so a run on a laptop never writes to the database.
+
+Every step of a run adds rows, and nothing is changed or deleted. Each row has a kind:
+
+    run        the run's settings and the versions of the materials it uses
+    answer     one model's answer to one question, one attempt
+    judgement  one judge's level and reason for one answer, in one prompt order
+    label      one answer's merged level, from one calculation
+    score      one model's score and rank, from one calculation
+    publish    the ranking JSON the website shows
+
+When a call is retried, or a run is re-judged or re-merged, the newest row counts.
 """
 
+import csv
+import json
+import re
+import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg
 from psycopg.types.json import Jsonb
 
 from src.scoring.merge import AnswerOutcome, level_score, merge, rank_models
+from src.scoring.report import PublishedRun, build_rankings
 from src.scoring.schema import Judgement
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS runs (
-    id BIGSERIAL PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'scored', 'published')),
-    question_set_version TEXT NOT NULL,
-    settings JSONB NOT NULL DEFAULT '{}',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at TIMESTAMPTZ
-);
+KINDS = ("run", "answer", "judgement", "label", "score", "publish")
 
-CREATE TABLE IF NOT EXISTS models (
-    name TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
-    effort TEXT NOT NULL DEFAULT 'default',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS answers (
-    id BIGSERIAL PRIMARY KEY,
-    run_id BIGINT NOT NULL REFERENCES runs (id),
-    model_name TEXT NOT NULL REFERENCES models (name),
-    question_id TEXT NOT NULL,
-    attempt SMALLINT NOT NULL CHECK (attempt >= 1),
-    answer_text TEXT,
-    status TEXT NOT NULL CHECK (status IN ('ok', 'blocked', 'failed')),
-    error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (run_id, model_name, question_id, attempt)
-);
-
--- One judge call: one judge, one prompt order, one answer.
-CREATE TABLE IF NOT EXISTS judgements (
-    id BIGSERIAL PRIMARY KEY,
-    answer_id BIGINT NOT NULL REFERENCES answers (id),
-    judge TEXT NOT NULL,
-    prompt_order TEXT NOT NULL,
-    rubric_version TEXT NOT NULL,
-    examples_version TEXT NOT NULL,
-    level TEXT,
-    reason TEXT,
-    status TEXT NOT NULL CHECK (status IN ('ok', 'blocked', 'failed')),
-    error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK ((status = 'ok') = (level IS NOT NULL))
-);
-CREATE INDEX IF NOT EXISTS judgements_answer_idx ON judgements (answer_id, judge, prompt_order, id DESC);
-
--- One answer's merged label, from one calculation.
-CREATE TABLE IF NOT EXISTS answer_labels (
-    id BIGSERIAL PRIMARY KEY,
-    answer_id BIGINT NOT NULL REFERENCES answers (id),
-    merge_method TEXT NOT NULL,
-    level TEXT NOT NULL,
-    score DOUBLE PRECISION NOT NULL CHECK (score BETWEEN 0 AND 1),
-    judgement_count INTEGER NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS answer_labels_answer_idx ON answer_labels (answer_id, id DESC);
-
-CREATE TABLE IF NOT EXISTS model_scores (
-    id BIGSERIAL PRIMARY KEY,
-    run_id BIGINT NOT NULL REFERENCES runs (id),
-    model_name TEXT NOT NULL REFERENCES models (name),
-    score DOUBLE PRECISION NOT NULL,
-    rank INTEGER NOT NULL,
-    scored_answers INTEGER NOT NULL,
-    blocked_answers INTEGER NOT NULL,
-    failed_answers INTEGER NOT NULL,
-    merge_method TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS model_scores_run_idx ON model_scores (run_id, created_at DESC);
-"""
-
-# The newest row of each (answer, judge, prompt order), whatever its status.
-NEWEST_JUDGEMENTS_SQL = """
-SELECT DISTINCT ON (j.answer_id, j.judge, j.prompt_order)
-       j.answer_id, j.judge, j.prompt_order, j.status
-FROM judgements j
-JOIN answers a ON a.id = j.answer_id
-WHERE a.run_id = %s
-ORDER BY j.answer_id, j.judge, j.prompt_order, j.id DESC
-"""
-
-# The newest successful row of each (answer, judge, prompt order).
-CURRENT_JUDGEMENTS_SQL = """
-SELECT DISTINCT ON (j.answer_id, j.judge, j.prompt_order)
-       j.answer_id, j.judge, j.prompt_order, j.level, j.reason
-FROM judgements j
-JOIN answers a ON a.id = j.answer_id
-WHERE a.run_id = %s AND j.status = 'ok'
-ORDER BY j.answer_id, j.judge, j.prompt_order, j.id DESC
-"""
-
-LATEST_RANKINGS_SQL = """
-WITH latest_run AS (
-    SELECT id FROM runs
-    WHERE status = 'published'
-    ORDER BY published_at DESC, id DESC
-    LIMIT 1
+COLUMNS = (
+    "id", "run_id", "kind", "model", "question_id", "category", "attempt", "judge",
+    "prompt_order", "level", "score", "status", "text", "error", "created_at",
 )
-SELECT rank, model_name, score
-FROM model_scores
-WHERE run_id = (SELECT id FROM latest_run)
-  AND created_at = (
-      SELECT MAX(created_at) FROM model_scores WHERE run_id = (SELECT id FROM latest_run)
-  )
-ORDER BY rank, model_name
+# Keys of `details` that get their own CSV column. Anything else, such as a
+# run's settings or a published ranking, stays as JSON text in `details`.
+DETAIL_COLUMNS = (
+    "rank", "scored", "blocked", "failed", "provider", "effort", "merge_method",
+    "judgement_count", "rubric_version", "examples_version",
+)
+CSV_COLUMNS = COLUMNS + DETAIL_COLUMNS + ("details",)
+INT_COLUMNS = {"id", "run_id", "attempt", "rank", "scored", "blocked", "failed", "judgement_count"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS log (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('run', 'answer', 'judgement', 'label', 'score', 'publish')),
+    model TEXT,
+    question_id TEXT,
+    category TEXT,
+    attempt SMALLINT CHECK (attempt >= 1),
+    judge TEXT,
+    prompt_order TEXT,
+    level TEXT,
+    score DOUBLE PRECISION CHECK (score BETWEEN 0 AND 1),
+    status TEXT CHECK (status IN ('ok', 'blocked', 'failed')),
+    text TEXT,
+    error TEXT,
+    details JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Each kind must fill the columns it is about.
+    CHECK (kind NOT IN ('answer', 'judgement', 'label')
+           OR (model IS NOT NULL AND question_id IS NOT NULL AND attempt IS NOT NULL)),
+    CHECK (kind NOT IN ('answer', 'judgement') OR status IS NOT NULL),
+    CHECK (kind <> 'judgement' OR (judge IS NOT NULL AND prompt_order IS NOT NULL AND (status = 'ok') = (level IS NOT NULL))),
+    CHECK (kind <> 'label' OR (level IS NOT NULL AND score IS NOT NULL)),
+    CHECK (kind <> 'score' OR (model IS NOT NULL AND score IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS log_run_idx ON log (run_id, kind, id);
+-- One run row per run, and an answer succeeds at most once per attempt.
+CREATE UNIQUE INDEX IF NOT EXISTS log_one_run_row ON log (run_id) WHERE kind = 'run';
+CREATE UNIQUE INDEX IF NOT EXISTS log_one_answer ON log (run_id, model, question_id, attempt)
+    WHERE kind = 'answer' AND status <> 'failed';
 """
 
 
-@dataclass(frozen=True)
-class AnswerToJudge:
-    answer_id: int
-    model_name: str
-    question_id: str
-    answer_text: str
+def _row(**fields) -> dict:
+    """A log row with every column, unset ones as None."""
+    row = {column: None for column in COLUMNS}
+    row["details"] = {}
+    row.update(fields)
+    return row
 
 
-class ScoringStore:
+def _answer_key(row: dict) -> tuple[str, str, int]:
+    return (row["model"], row["question_id"], row["attempt"])
+
+
+def _newest(rows: list[dict], key) -> dict:
+    """The newest row for each key. Rows come oldest first."""
+    newest = {}
+    for row in rows:
+        newest[key(row)] = row
+    return newest
+
+
+def _newest_calculation(rows: list[dict]) -> list[dict]:
+    """Rows from the newest calculation: they share one created_at."""
+    if not rows:
+        return []
+    latest = max(row["created_at"] for row in rows)
+    return [row for row in rows if row["created_at"] == latest]
+
+
+def to_csv(row: dict) -> list:
+    """One log row as CSV values, in CSV_COLUMNS order."""
+    details = dict(row["details"] or {})
+    values = [row[column] for column in COLUMNS]
+    values[COLUMNS.index("created_at")] = row["created_at"].isoformat() if row["created_at"] else None
+    values += [details.pop(key, None) for key in DETAIL_COLUMNS]
+    values.append(json.dumps(details, ensure_ascii=False) if details else "")
+    return values
+
+
+def from_csv(record: dict[str, str]) -> dict:
+    """The inverse of to_csv. Empty cells become None."""
+    def value(column: str):
+        text = record.get(column, "")
+        if text == "":
+            return None
+        if column in INT_COLUMNS:
+            return int(text)
+        if column == "score":
+            return float(text)
+        if column == "created_at":
+            return datetime.fromisoformat(text)
+        return text
+
+    row = _row(**{column: value(column) for column in COLUMNS})
+    row["details"] = json.loads(record["details"]) if record.get("details") else {}
+    row["details"].update({key: value(key) for key in DETAIL_COLUMNS if value(key) is not None})
+    return row
+
+
+def write_csv(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # utf-8-sig, so Excel shows the text correctly.
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CSV_COLUMNS)
+        writer.writerows(to_csv(row) for row in rows)
+
+
+class SqlLog:
+    """The `log` table in PostgreSQL."""
+
     def __init__(self, database_url: str):
         if not database_url:
             raise ValueError("DATABASE_URL must be set")
@@ -144,37 +165,160 @@ class ScoringStore:
         with self._connect() as connection:
             connection.execute(SCHEMA)
 
-    def create_run(self, question_set_version: str, settings: dict | None = None) -> int:
+    def new_run(self, details: dict) -> int:
+        """Add a run row and return its ID: one more than the highest so far."""
         with self._connect() as connection:
-            row = connection.execute(
-                "INSERT INTO runs (question_set_version, settings) VALUES (%s, %s) RETURNING id",
-                (question_set_version, Jsonb(settings or {})),
-            ).fetchone()
-        return row[0]
+            # Stops two runs that start at once from taking the same ID.
+            connection.execute("LOCK TABLE log IN SHARE ROW EXCLUSIVE MODE")
+            return connection.execute(
+                "INSERT INTO log (run_id, kind, details) "
+                "SELECT COALESCE(MAX(run_id), 0) + 1, 'run', %s FROM log RETURNING run_id",
+                (Jsonb(details),),
+            ).fetchone()[0]
 
-    def run_status(self, run_id: int) -> str | None:
+    def append(self, rows: list[dict]) -> None:
+        """Add rows in one transaction. A second success for the same answer is skipped."""
+        columns = [c for c in COLUMNS if c not in ("id", "created_at")]
         with self._connect() as connection:
-            row = connection.execute("SELECT status FROM runs WHERE id = %s", (run_id,)).fetchone()
+            connection.cursor().executemany(
+                f"INSERT INTO log ({', '.join(columns)}, details, created_at) "
+                f"VALUES ({', '.join(['%s'] * len(columns))}, %s, COALESCE(%s, now())) ON CONFLICT DO NOTHING",
+                [[row[c] for c in columns] + [Jsonb(row["details"]), row["created_at"]] for row in rows],
+            )
+
+    def read(self, run_id: int | None = None, kinds=None, text: bool = True) -> list[dict]:
+        """Rows oldest first, for one run or all, of the given kinds or all."""
+        selected = [c if c != "text" or text else "NULL" for c in COLUMNS]
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(selected)}, details FROM log "
+                "WHERE (%(run_id)s::bigint IS NULL OR run_id = %(run_id)s) "
+                "AND (%(kinds)s::text[] IS NULL OR kind = ANY(%(kinds)s)) ORDER BY id",
+                {"run_id": run_id, "kinds": list(kinds) if kinds else None},
+            ).fetchall()
+        return [_row(**dict(zip(COLUMNS, values)), details=details) for *values, details in rows]
+
+    def published_ranking(self) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT details FROM log WHERE kind = 'publish' ORDER BY id DESC LIMIT 1").fetchone()
         return row[0] if row else None
 
-    def save_models(self, models) -> None:
-        with self._connect() as connection:
-            for model in models:
-                connection.execute(
-                    "INSERT INTO models (name, provider, effort) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, effort = EXCLUDED.effort",
-                    (model.name, model.provider, model.effort),
-                )
+
+class CsvLog:
+    """One CSV file per run in a folder on this computer, with the same rows as SqlLog."""
+
+    FILE = re.compile(r"run_(\d+)\.csv")
+
+    def __init__(self, directory: Path = Path("exports")):
+        self.directory = Path(directory)
+        self._lock = threading.Lock()
+        self._rows: dict[int, list[dict]] = {}
+
+    def path(self, run_id: int) -> Path:
+        return self.directory / f"run_{run_id}.csv"
+
+    def init_schema(self) -> None:
+        """Nothing to create: a run's file is created when the run starts."""
+
+    def _run_ids(self) -> list[int]:
+        if not self.directory.exists():
+            return []
+        return sorted(int(m.group(1)) for p in self.directory.iterdir() if (m := self.FILE.fullmatch(p.name)))
+
+    def _load(self, run_id: int) -> list[dict]:
+        if run_id not in self._rows:
+            path = self.path(run_id)
+            if path.exists():
+                with path.open(newline="", encoding="utf-8-sig") as handle:
+                    self._rows[run_id] = [from_csv(record) for record in csv.DictReader(handle)]
+            else:
+                self._rows[run_id] = []
+        return self._rows[run_id]
+
+    def new_run(self, details: dict) -> int:
+        with self._lock:
+            run_id = max(self._run_ids(), default=0) + 1
+            self.directory.mkdir(parents=True, exist_ok=True)
+            write_csv([], self.path(run_id))
+            self._rows[run_id] = []
+            self._append(run_id, [_row(run_id=run_id, kind="run", details=details)])
+        return run_id
+
+    def append(self, rows: list[dict]) -> None:
+        with self._lock:
+            for run_id in dict.fromkeys(row["run_id"] for row in rows):
+                self._append(run_id, [row for row in rows if row["run_id"] == run_id])
+
+    def _append(self, run_id: int, rows: list[dict]) -> None:
+        saved = self._load(run_id)
+        if not self.path(run_id).exists():
+            raise ValueError(f"Run {run_id} has no local log at {self.path(run_id)}")
+        succeeded = {_answer_key(r) for r in saved if r["kind"] == "answer" and r["status"] != "failed"}
+        now = datetime.now(timezone.utc)
+        added = []
+        for row in rows:
+            # The same rule as the database: an answer succeeds at most once per attempt.
+            if row["kind"] == "answer" and row["status"] != "failed":
+                if _answer_key(row) in succeeded:
+                    continue
+                succeeded.add(_answer_key(row))
+            added.append({**row, "id": len(saved) + len(added) + 1, "created_at": row["created_at"] or now})
+        with self.path(run_id).open("a", newline="", encoding="utf-8-sig") as handle:
+            csv.writer(handle).writerows(to_csv(row) for row in added)
+        saved.extend(added)
+
+    def read(self, run_id: int | None = None, kinds=None, text: bool = True) -> list[dict]:
+        with self._lock:
+            run_ids = [run_id] if run_id is not None else self._run_ids()
+            rows = [row for rid in run_ids for row in self._load(rid)]
+        return [row for row in rows if not kinds or row["kind"] in kinds]
+
+    def published_ranking(self) -> dict | None:
+        published = self.read(kinds=("publish",))
+        return max(published, key=lambda row: row["created_at"])["details"] if published else None
+
+
+@dataclass(frozen=True)
+class AnswerToJudge:
+    model_name: str
+    question_id: str
+    attempt: int
+    category: str
+    answer_text: str
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        return (self.model_name, self.question_id, self.attempt)
+
+
+class LogStore:
+    """What the engine asks of the log. `log` is a SqlLog or a CsvLog."""
+
+    def __init__(self, log: SqlLog | CsvLog):
+        self.log = log
+
+    def init_schema(self) -> None:
+        self.log.init_schema()
+
+    def create_run(self, question_set_version: str, settings: dict | None = None) -> int:
+        return self.log.new_run({**(settings or {}), "question_set_version": question_set_version})
+
+    def run_status(self, run_id: int) -> str | None:
+        """'running', 'scored' or 'published', or None if the run does not exist."""
+        kinds = {row["kind"] for row in self.log.read(run_id, ("run", "score", "publish"))}
+        if "run" not in kinds:
+            return None
+        return "published" if "publish" in kinds else "scored" if "score" in kinds else "running"
+
+    def _answers(self, run_id: int, text: bool = False) -> dict:
+        return _newest(self.log.read(run_id, ("answer",), text), _answer_key)
+
+    def _judgements(self, run_id: int) -> list[dict]:
+        return self.log.read(run_id, ("judgement",), text=False)
 
     def finished_answers(self, run_id: int) -> set[tuple[str, str, int]]:
         """Return answer calls that need no retry when a run restarts."""
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT model_name, question_id, attempt FROM answers "
-                "WHERE run_id = %s AND status <> 'failed'",
-                (run_id,),
-            ).fetchall()
-        return {(row[0], row[1], row[2]) for row in rows}
+        return {key for key, row in self._answers(run_id).items() if row["status"] != "failed"}
 
     def save_answer(
         self,
@@ -185,39 +329,30 @@ class ScoringStore:
         status: str,
         answer_text: str | None = None,
         error: str | None = None,
+        category: str | None = None,
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO answers (run_id, model_name, question_id, attempt, answer_text, status, error)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (run_id, model_name, question_id, attempt) DO UPDATE
-                SET answer_text = EXCLUDED.answer_text, status = EXCLUDED.status,
-                    error = EXCLUDED.error, created_at = now()
-                WHERE answers.status = 'failed'
-                """,
-                (run_id, model_name, question_id, attempt, answer_text, status, error),
-            )
+        self.log.append([_row(
+            run_id=run_id, kind="answer", model=model_name, question_id=question_id, category=category,
+            attempt=attempt, status=status, text=answer_text, error=error,
+        )])
 
     def answers_to_judge(self, run_id: int) -> list[AnswerToJudge]:
         """Return every answer in the run that has text to judge."""
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT id, model_name, question_id, answer_text FROM answers "
-                "WHERE run_id = %s AND status = 'ok' ORDER BY id",
-                (run_id,),
-            ).fetchall()
-        return [AnswerToJudge(*row) for row in rows]
+        return [
+            AnswerToJudge(row["model"], row["question_id"], row["attempt"], row["category"], row["text"])
+            for row in sorted(self._answers(run_id, text=True).values(), key=lambda r: r["id"])
+            if row["status"] == "ok"
+        ]
 
-    def finished_judgements(self, run_id: int) -> set[tuple[int, str, str]]:
-        """Return (answer, judge, prompt order) calls that need no retry when a run restarts."""
-        with self._connect() as connection:
-            rows = connection.execute(NEWEST_JUDGEMENTS_SQL, (run_id,)).fetchall()
-        return {(row[0], row[1], row[2]) for row in rows if row[3] != "failed"}
+    def finished_judgements(self, run_id: int) -> set[tuple[tuple[str, str, int], str, str]]:
+        """Return (answer key, judge, prompt order) calls that need no retry when a run restarts."""
+        newest = _newest(self._judgements(run_id), lambda r: (_answer_key(r), r["judge"], r["prompt_order"]))
+        return {key for key, row in newest.items() if row["status"] != "failed"}
 
     def add_judgement(
         self,
-        answer_id: int,
+        run_id: int,
+        answer: AnswerToJudge,
         judge: str,
         prompt_order: str,
         rubric_version: str,
@@ -227,97 +362,106 @@ class ScoringStore:
         reason: str | None = None,
         error: str | None = None,
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO judgements
-                    (answer_id, judge, prompt_order, rubric_version, examples_version, level, reason, status, error)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (answer_id, judge, prompt_order, rubric_version, examples_version, level, reason, status, error),
-            )
+        self.log.append([_row(
+            run_id=run_id, kind="judgement", model=answer.model_name, question_id=answer.question_id,
+            category=answer.category, attempt=answer.attempt, judge=judge, prompt_order=prompt_order,
+            level=level, status=status, text=reason, error=error,
+            details={"rubric_version": rubric_version, "examples_version": examples_version},
+        )])
 
     def calculate(self, run_id: int, merge_method: str, judges, orders) -> None:
-        """Merge each answer's judgements, save new model scores and ranks, and mark the run as scored.
+        """Merge each answer's judgements, and add label and score rows for this calculation.
 
         Only judgements from the given judges and prompt orders count, so a
         judge removed from the config stops affecting the result.
         """
         judges, orders = set(judges), set(orders)
-        with self._connect() as connection:
-            answers = connection.execute(
-                "SELECT id, model_name, question_id, status FROM answers WHERE run_id = %s", (run_id,)
-            ).fetchall()
-            current: dict[int, list[Judgement]] = {}
-            for answer_id, judge, order, level, reason in connection.execute(CURRENT_JUDGEMENTS_SQL, (run_id,)):
-                if judge in judges and order in orders:
-                    current.setdefault(answer_id, []).append(Judgement(judge, order, level, reason))
-            blocked_by_judge = {
-                answer_id
-                for answer_id, judge, order, status in connection.execute(NEWEST_JUDGEMENTS_SQL, (run_id,))
-                if status == "blocked" and judge in judges and order in orders
-            }
+        counted = [r for r in self._judgements(run_id) if r["judge"] in judges and r["prompt_order"] in orders]
+        call = lambda r: (_answer_key(r), r["judge"], r["prompt_order"])
+        current: dict[tuple, list[Judgement]] = {}
+        for row in _newest([r for r in counted if r["status"] == "ok"], call).values():
+            current.setdefault(_answer_key(row), []).append(Judgement(row["judge"], row["prompt_order"], row["level"]))
+        blocked_by_judge = {answer for (answer, _, _), r in _newest(counted, call).items() if r["status"] == "blocked"}
 
-            outcomes, labels = [], []
-            for answer_id, model_name, question_id, status in answers:
-                judgements = current.get(answer_id, [])
-                level = merge(judgements, merge_method)
-                blocked = status == "blocked" or answer_id in blocked_by_judge
-                outcomes.append(AnswerOutcome(model_name, question_id, level, blocked))
-                if level is not None:
-                    labels.append((answer_id, merge_method, level, level_score(level), len(judgements)))
-            connection.cursor().executemany(
-                "INSERT INTO answer_labels (answer_id, merge_method, level, score, judgement_count) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                labels,
-            )
+        # One created_at marks every row of this calculation.
+        now = datetime.now(timezone.utc)
+        outcomes, rows = [], []
+        for key, answer in self._answers(run_id).items():
+            judgements = current.get(key, [])
+            level = merge(judgements, merge_method)
+            blocked = answer["status"] == "blocked" or key in blocked_by_judge
+            outcomes.append(AnswerOutcome(answer["model"], answer["question_id"], level, blocked))
+            if level is not None:
+                rows.append(_row(
+                    run_id=run_id, kind="label", model=answer["model"], question_id=answer["question_id"],
+                    category=answer["category"], attempt=answer["attempt"], level=level, score=level_score(level),
+                    created_at=now, details={"merge_method": merge_method, "judgement_count": len(judgements)},
+                ))
+        listed = {m["name"]: m for m in self._settings(run_id).get("models", [])}
+        for result in rank_models(outcomes):
+            model = listed.get(result["model"], {})
+            rows.append(_row(
+                run_id=run_id, kind="score", model=result["model"], score=result["score"], created_at=now,
+                details={
+                    "rank": result["rank"], "scored": result["scored"], "blocked": result["blocked"],
+                    "failed": result["failed"], "merge_method": merge_method,
+                    "provider": model.get("provider", ""), "effort": model.get("effort", "default"),
+                },
+            ))
+        self.log.append(rows)
 
-            # One transaction, so every row of this calculation shares one created_at.
-            for row in rank_models(outcomes):
-                connection.execute(
-                    """
-                    INSERT INTO model_scores
-                        (run_id, model_name, score, rank, scored_answers, blocked_answers, failed_answers, merge_method)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (run_id, row["model"], row["score"], row["rank"], row["scored"], row["blocked"], row["failed"], merge_method),
-                )
-            connection.execute(
-                "UPDATE runs SET status = 'scored' WHERE id = %s AND status = 'running'",
-                (run_id,),
-            )
+    def _settings(self, run_id: int) -> dict:
+        rows = self.log.read(run_id, ("run",))
+        return rows[0]["details"] if rows else {}
+
+    def _newest_scores(self, run_id: int) -> list[dict]:
+        rows = _newest_calculation(self.log.read(run_id, ("score",)))
+        return sorted(rows, key=lambda r: (r["details"]["rank"], r["model"]))
 
     def run_rankings(self, run_id: int) -> list[dict]:
         """Return a run's newest ranking, with its answer counts, for review."""
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT rank, model_name, score, scored_answers, blocked_answers, failed_answers
-                FROM model_scores
-                WHERE run_id = %(run_id)s
-                  AND created_at = (SELECT MAX(created_at) FROM model_scores WHERE run_id = %(run_id)s)
-                ORDER BY rank, model_name
-                """,
-                {"run_id": run_id},
-            ).fetchall()
         return [
-            {"rank": r[0], "model": r[1], "score": r[2], "scored": r[3], "blocked": r[4], "failed": r[5]}
-            for r in rows
+            {"rank": r["details"]["rank"], "model": r["model"], "score": r["score"], "scored": r["details"]["scored"],
+             "blocked": r["details"]["blocked"], "failed": r["details"]["failed"]}
+            for r in self._newest_scores(run_id)
         ]
 
     def publish(self, run_id: int) -> None:
-        """Make a scored run the one the website shows."""
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE runs SET status = 'published', published_at = now() "
-                "WHERE id = %s AND status IN ('scored', 'published')",
-                (run_id,),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError(f"Run {run_id} does not exist or has not been scored")
+        """Save the run's newest ranking as a copy: the one the website shows."""
+        scores = self._newest_scores(run_id)
+        if not scores:
+            raise ValueError(f"Run {run_id} does not exist or has not been scored")
+        by_question: dict[tuple, list[float]] = {}
+        for row in _newest_calculation(self.log.read(run_id, ("label",))):
+            by_question.setdefault((row["model"], row["question_id"], row["category"]), []).append(row["score"])
+        rubric_versions = {
+            r["details"].get("rubric_version") for r in self._judgements(run_id) if r["status"] == "ok"
+        }
+        published = PublishedRun(
+            run_id=run_id,
+            settings=self._settings(run_id),
+            published_at=datetime.now(timezone.utc),
+            rubric_versions=sorted(v for v in rubric_versions if v),
+            scores=[
+                {"rank": r["details"]["rank"], "model": r["model"], "provider": r["details"]["provider"],
+                 "effort": r["details"]["effort"], "score": r["score"]}
+                for r in scores
+            ],
+            question_scores=[
+                {"model": m, "question_id": q, "category": c, "score": sum(s) / len(s)}
+                for (m, q, c), s in by_question.items()
+            ],
+        )
+        self.log.append([_row(run_id=run_id, kind="publish", details=build_rankings(published))])
 
-    def latest_rankings(self) -> list[dict]:
-        """Return the newest published ranking, or an empty list if there is none."""
-        with self._connect() as connection:
-            rows = connection.execute(LATEST_RANKINGS_SQL).fetchall()
-        return [{"rank": row[0], "model": row[1], "score": round(row[2], 4)} for row in rows]
+    def published_ranking(self) -> dict | None:
+        """Return the ranking JSON saved by the newest publish, or None if nothing is published."""
+        return self.log.published_ranking()
+
+    def export(self, run_id: int, path: Path, kind: str | None = None) -> int:
+        """Write a run's rows, oldest first, to a CSV file and return how many were written."""
+        if kind is not None and kind not in KINDS:
+            raise ValueError(f"Unknown kind {kind!r}. Choose from: {', '.join(KINDS)}")
+        rows = self.log.read(run_id, (kind,) if kind else None)
+        write_csv(rows, path)
+        return len(rows)

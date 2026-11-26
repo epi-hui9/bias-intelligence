@@ -14,26 +14,33 @@ from src.scoring.schema import Model
 # For now `effort` is only recorded with the run: every call uses the
 # provider's default setting.
 CANDIDATE_MODELS = [
-    Model("gpt-6.1-sol", "OpenAI"),
-    Model("gpt-5.5", "OpenAI"),
+    # zfj todo: testing the whole project with 1 candidate (2026-11-25). Uncomment
+    # the other 16 for a real run. gpt-5.4-mini is not a judge, so all 3 judges
+    # judge its answers (a judge never judges its own).
+    # Model("gpt-6.1-sol", "OpenAI"),
+    # Model("gpt-5.5", "OpenAI"),
     Model("gpt-5.4-mini", "OpenAI"),
-    Model("gpt-oss-120b", "OpenAI"),
-    Model("claude-fable-5-1", "Anthropic"),
-    Model("claude-opus-5-5", "Anthropic"),
-    Model("claude-sonnet-5-5", "Anthropic"),
-    Model("claude-haiku-5-5", "Anthropic"),
-    Model("Llama-4-Maverick-17B-128E-Instruct-FP8", "Meta"),
-    Model("Llama-3.3-70B-Instruct", "Meta"),
-    Model("muse-spark-1.3", "Meta"),
-    Model("DeepSeek-V4-Pro", "DeepSeek"),
-    Model("DeepSeek-V4-Flash", "DeepSeek"),
-    Model("grok-4.7", "xAI"),
-    Model("grok-4-1-fast-non-reasoning", "xAI"),
-    Model("Mistral-Large-3", "Mistral AI"),
-    Model("MAI-Thinking-1", "Microsoft"),
-    Model("Kimi-K3.1-Pro", "MoonshotAI"),
-    Model("qwen3.8-27b", "Alibaba"),
-    Model("cohere-command-a", "Cohere"),
+    # Model("gpt-oss-120b", "OpenAI"),
+    # Model("claude-fable-5-1", "Anthropic"),
+    # Model("claude-opus-5-5", "Anthropic"),
+    # Model("claude-sonnet-5-5", "Anthropic"),
+    # Model("claude-haiku-5-5", "Anthropic"),
+    # Model("Llama-4-Maverick-17B-128E-Instruct-FP8", "Meta"),
+    # zfj todo: dropped 2026-11-23, the subscription's shared quota for it was full
+    # (2000 of 2000). Uncomment when there is quota.
+    # Model("Llama-3.3-70B-Instruct", "Meta"),
+    # zfj todo: dropped 2026-11-23, not listed on Azure in northcentralus or eastus2.
+    # Model("muse-spark-1.3", "Meta"),
+    # Model("DeepSeek-V4-Pro", "DeepSeek"),
+    # Model("DeepSeek-V4-Flash", "DeepSeek"),
+    # Model("grok-4.7", "xAI"),
+    # Model("grok-4-1-fast-non-reasoning", "xAI"),
+    # Model("Mistral-Large-3", "Mistral AI"),
+    # Model("MAI-Thinking-1", "Microsoft"),
+    # Model("Kimi-K3.1-Pro", "MoonshotAI"),
+    # zfj todo: dropped 2026-11-23, Azure lists it in northcentralus with no deployment option.
+    # Model("qwen3.8-27b", "Alibaba"),
+    # Model("cohere-command-a", "Cohere"),
 ]
 
 # How many times each model answers each question.
@@ -63,10 +70,15 @@ EXAMPLE_STATUSES = ["Confirmed"]
 MERGE_METHOD = "median_of_medians"
 
 # --- Data -------------------------------------------------------------------
-# Where the materials come from. Loaders are in loaders.py.
-DATA_SOURCE = "disk"
-QUESTIONS_FILE = "question_set_v1.csv"
-RUBRIC_FILE = "rubric_v2.csv"
+# Where the questions, rubric and examples come from: "sql" or "disk".
+# Loaders are in loaders.py.
+DATA_SOURCE = "sql"
+# The files `import-materials` copies into SQL. A file's name without .csv is its
+# version in SQL, so these also choose which version a run reads.
+# Human-written questions are evaluated first. The AI-generated set is
+# question_set_v1.csv; switch back by naming it here.
+QUESTIONS_FILE = "question_set_human_v1.csv"
+RUBRIC_FILE = "rubric_v3.csv"
 EXAMPLES_FILE = "rubric_examples_v1.csv"
 
 # Category names as written in the question set or examples file -> the
@@ -78,12 +90,20 @@ CATEGORY_ALIASES = {
     "Science Technology Medicine": "Science, Technology, & Medicine",
 }
 
-# zfj todo: these categories are skipped (not asked, not judged) until the
-# rubric team finishes them. Education has no rubric row, and Disability has
-# no Medium Bias or High Bias text. Remove a name here once its rubric is complete.
-SKIP_CATEGORIES = ["Education", "Disability"]
+# Categories listed here are not asked or judged. Use it when a category's
+# rubric is incomplete. Empty since rubric_v3 (2026-11-22) wrote every level.
+SKIP_CATEGORIES = []
 
 # --- Calls ------------------------------------------------------------------
+# Who answers and judges: "azure" calls the real models, "mock" uses
+# mock_llm.py (a fixed answer, a fixed reason, a seeded random label).
+# zfj todo: set to "azure" once we have access to the project's Azure resource group.
+LLM_MODE = "mock"
+# The same seed gives the same mock results every run. Change it for new ones.
+MOCK_SEED = 42
+# Share of mock answers that act as if a content filter blocked them.
+MOCK_BLOCK_RATE = 0.02
+
 WORKERS = 8
 MAX_RETRIES = 3
 RETRY_BASE_SECONDS = 2.0
@@ -104,6 +124,8 @@ class ScoringConfig:
     exclude_self_judging: bool = EXCLUDE_SELF_JUDGING
     few_shots_per_level: int = FEW_SHOTS_PER_LEVEL
     merge_method: str = MERGE_METHOD
+    llm_mode: str = LLM_MODE
+    mock_seed: int = MOCK_SEED
     workers: int = WORKERS
     retry_base_seconds: float = RETRY_BASE_SECONDS
     models: tuple[Model, ...] = field(default_factory=lambda: tuple(CANDIDATE_MODELS))
@@ -118,5 +140,8 @@ class ScoringConfig:
             "exclude_self_judging": self.exclude_self_judging,
             "few_shots_per_level": self.few_shots_per_level,
             "merge_method": self.merge_method,
-            "models": [{"name": m.name, "provider": m.provider, "effort": m.effort} for m in self.models],
+            # A mock run is marked, so its results are never mistaken for real ones.
+            "llm_mode": self.llm_mode,
+            **({"mock_seed": self.mock_seed} if self.llm_mode == "mock" else {}),
+            "models":[{"name": m.name, "provider": m.provider, "effort": m.effort} for m in self.models],
         }

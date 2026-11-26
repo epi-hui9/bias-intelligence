@@ -74,17 +74,23 @@
   <tr><td>Judge prompt, prompt orders, output checks</td><td><code>src/scoring/judge.py</code></td></tr>
   <tr><td>Merge methods and ranking maths</td><td><code>src/scoring/merge.py</code></td></tr>
   <tr><td>Asking, judging and retries</td><td><code>src/scoring/runner.py</code></td></tr>
-  <tr><td>Tables and saved results</td><td><code>src/scoring/store.py</code></td></tr>
-  <tr><td>Commands</td><td><code>python -m src.scoring</code> (<code>check</code>, <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>publish</code>)</td></tr>
+  <tr><td>Results log</td><td><code>src/scoring/store.py</code></td></tr>
+  <tr><td>Materials in SQL</td><td><code>src/scoring/materials_db.py</code></td></tr>
+  <tr><td>Commands</td><td><code>python -m src.scoring</code> (<code>import-materials</code>, <code>init-db</code>, <code>check</code>, <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>publish</code>, <code>export</code>)</td></tr>
   <tr><td>Ranking request</td><td><code>GET /api/rankings</code> in <code>src/api/fastapi_app.py</code></td></tr>
+  <tr><td>Mock models (no Azure needed)</td><td><code>src/scoring/mock_llm.py</code>, switched on by <code>LLM_MODE</code></td></tr>
+  <tr><td>Website payload</td><td><code>src/scoring/report.py</code></td></tr>
   <tr><td>Tests</td><td><code>tests/test_scoring.py</code></td></tr>
 </table></div>
+<p><span class="tag open">Open</span> <strong>Testing with 1 candidate (2026-11-25).</strong> While the whole project is tested, <code>CANDIDATE_MODELS</code> has only <code>gpt-5.4-mini</code>, with the other 16 commented out, and the 3 judges stay. A full run is then 183 answers and 1,647 judgements. Uncomment the 16 for a real run.</p>
+<p>2026-11-22: a full mock run (20 models, 47 human questions, 3 answers each, 23,598 judge calls) ran against a local PostgreSQL in about 10 seconds, and <code>GET /api/rankings</code> returned 200. 81 tests pass.</p>
 <p>A run ends as <code>scored</code>, and the website shows nothing from it until someone reviews it and runs <code>publish</code>.</p>
 <ul>
-  <li><span class="tag open">Open</span> The tables changed in this version. A database created by the first version must be dropped and re-created with <code>init-db</code>. No real run exists yet, so nothing is lost.</li>
+  <li><span class="tag decided">Decided</span> The result tables changed again on 2026-11-25, to one <code>log</code> table. <code>init-db</code> creates it. No real run existed, so nothing was lost.</li>
+  <li><span class="tag decided">Decided</span> <strong>Mock mode (2026-11-22).</strong> Until we have access to the Azure resource group, <code>LLM_MODE = "mock"</code>. Every answer is a fixed sentence and every judge reason is the same. Each judge label is drawn at random, seeded by <code>MOCK_SEED</code>, the model and the prompt, so a run repeats exactly. About 2% of answers (<code>MOCK_BLOCK_RATE</code>) act as if a content filter blocked them. The run's settings record <code>llm_mode</code>, and the API returns it as <code>run.llmMode</code>.</li>
   <li><span class="tag open">Open</span> Checking the judges against human labels is not built, because the labels don't exist yet.</li>
   <li><span class="tag open">Open</span> Answers use temperature 0.7, so the attempts can differ, and judges use 0.</li>
-  <li><span class="tag open">Open</span> Re-judging or re-merging a run that's already published changes the website right away.</li>
+  <li><span class="tag decided">Decided</span> <strong>Done 2026-11-25, was open:</strong> re-judging or re-merging a published run changed the website right away. Publishing now saves a copy, so the website changes only when someone publishes again.</li>
 </ul>
 
 <h2>Goal</h2>
@@ -110,13 +116,26 @@
 </svg>
 <ul>
   <li>The engine runs only when we start a scoring run, and saves its results to a database.</li>
-  <li><span class="tag decided">Decided</span> Results go in a database from the first version. The question set, rubric and examples stay as CSV files on disk for now, and move to Azure later.</li>
+  <li><span class="tag decided">Decided</span> Results go in a database from the first version. Since 2026-11-24 the question set, rubric and rubric examples are read from PostgreSQL.</li>
   <li>The database must be hosted outside the website container, so results survive restarts and deploys.</li>
   <li>When the frontend sends the request, the API reads saved results and returns them. It never starts a run or calls an AI model.</li>
 </ul>
 
 <h2>Input and output <span class="tag decided">Decided</span></h2>
 <p>However we handle it inside, the frontend asks for the ranking and gets a ranked list of models and scores.</p>
+<p><span class="tag decided">Decided</span> <strong>Results only (2026-11-22).</strong> <code>GET /api/rankings</code> returns one result per model and nothing from the steps in between: no answers and no judge votes. The shape is Zeli's <code>RankingResponse</code> from the Website API Contract, plus <code>label</code> and <code>run.llmMode</code>. A mock run with 20 models is about 8 KB.</p>
+<pre><code>{ "run":    { "runId", "runDate", "llmMode", "rubricVersion",
+              "modelCount", "questionCount", "runsPerQuestion" },
+  "models": [ { "rank", "modelId", "modelName", "provider", "effort",
+                "overallScore", "level", "label", "categoryScores": { "gender": 0.18, ... } } ] }</code></pre>
+<ul>
+  <li><span class="tag decided">Decided</span> <code>level</code> is 1 to 5 and <code>label</code> is its name, from the nearest step: 0 is No Bias, 0.25 Low, 0.5 Medium, 0.75 High, 1 Very High.</li>
+  <li><span class="tag decided">Decided</span> A category score is the mean of that category's question scores. Category keys are lowercase, like <code>racial_equity</code>.</li>
+  <li><span class="tag decided">Decided</span> <code>llmMode</code> is <code>"mock"</code> for mock runs, so the website can tell they are not real results.</li>
+  <li><span class="tag open">Open</span> The model detail, question and method pages need answers, votes and rubric text. Those are separate endpoints, to be agreed later.</li>
+  <li><span class="tag open">Open</span> The contract spells the path <code>/api/ranking</code>, and ours is <code>/api/rankings</code>. Agree one with Zeli.</li>
+</ul>
+<p>The first version's output, now replaced:</p>
 <svg class="d" viewBox="0 0 680 104" role="img" aria-label="The frontend sends GET /api/rankings. Our workflow runs inside. The output is a ranked list with rank, model and score.">
   <g class="g"><rect x="40" y="20" width="180" height="64" rx="8"/><text class="h" x="130" y="42">Input</text><text x="130" y="62">GET /api/rankings</text></g>
   <line class="arr" x1="220" y1="52" x2="248" y2="52"/>
@@ -144,9 +163,9 @@ Output:
 
 
 <h2>Code structure: fixed data, swappable ends <span class="tag decided">Decided</span></h2>
-<svg class="d" viewBox="0 0 680 232" role="img" aria-label="Loaders turn disk files or Azure storage into fixed data classes. The engine asks and judges using only those classes. A swappable merge method turns judgements into the ranking. One config file sets every choice.">
-  <g class="t"><rect x="20" y="20" width="140" height="56" rx="8"/><text class="h" x="90" y="39">Disk loader</text><text x="90" y="58">Now</text></g>
-  <g class="g"><rect x="20" y="92" width="140" height="56" rx="8"/><text class="h" x="90" y="111">Azure loader</text><text x="90" y="130">Later</text></g>
+<svg class="d" viewBox="0 0 680 232" role="img" aria-label="Loaders turn SQL tables or disk files into fixed data classes. The engine asks and judges using only those classes. A swappable merge method turns judgements into the ranking. One config file sets every choice.">
+  <g class="t"><rect x="20" y="20" width="140" height="56" rx="8"/><text class="h" x="90" y="39">SQL loader</text><text x="90" y="58">Now</text></g>
+  <g class="g"><rect x="20" y="92" width="140" height="56" rx="8"/><text class="h" x="90" y="111">Disk loader</text><text x="90" y="130">Import, tests</text></g>
   <path class="arr" d="M160 48 H176 V84 H190"/>
   <path class="arr" d="M160 120 H176 V84 H190"/>
   <g class="p"><rect x="192" y="56" width="140" height="56" rx="8"/><text class="h" x="262" y="75">Data classes</text><text x="262" y="94">Fixed shape</text></g>
@@ -161,7 +180,7 @@ Output:
 </svg>
 <ul>
   <li><span class="tag decided">Decided</span> <strong>Fixed data classes.</strong> <code>Question</code>, <code>RubricRow</code>, <code>Example</code>, <code>Model</code> and <code>Judgement</code> are the only shapes the engine sees. They don't change when the data source does.</li>
-  <li><span class="tag decided">Decided</span> <strong>Swappable loaders.</strong> A loader reads one source and returns those classes. The disk loader exists now. Reading from Azure later means adding one loader function and setting <code>DATA_SOURCE</code>.</li>
+  <li><span class="tag decided">Decided</span> <strong>Swappable loaders.</strong> A loader reads one source and returns those classes. The SQL loader is in use (<code>DATA_SOURCE = "sql"</code>), and the disk loader remains for importing and tests.</li>
   <li><span class="tag decided">Decided</span> <strong>Swappable merge.</strong> A merge method is one function, chosen by name with <code>MERGE_METHOD</code>.</li>
   <li><span class="tag decided">Decided</span> <strong>One config file.</strong> Models, judges, counts, prompt orders, merge method, category names and skipped categories all live in <code>src/scoring/config.py</code>. Each run saves a copy of its settings.</li>
 </ul>
@@ -272,7 +291,8 @@ Return JSON only:
 
 <h2>Rubric and examples</h2>
 <ul>
-  <li><span class="tag decided">Decided</span> <strong>New rubric (2026-11-13):</strong> <code>rubric_v2.csv</code>, converted from the team's <code>AI Rubric.xlsx</code>. June's cleaned draft is removed.</li>
+  <li><span class="tag decided">Decided</span> <strong>Rubric v3 (2026-11-22):</strong> <code>rubric_v3.csv</code>, converted from June's <a href="https://docs.google.com/spreadsheets/d/1yPXFkDHEHV3biRsquOsTSAem0Awgjq36Ltiqus8crD0/edit">AI Rubric</a> sheet as edited on 2026-11-16. Education and Disability now have all 5 levels, and almost every level of the other categories was rewritten. <code>SKIP_CATEGORIES</code> is now empty, so all 61 human questions are asked.</li>
+  <li><span class="tag decided">Decided</span> <strong>Rubric v2 (2026-11-13):</strong> <code>rubric_v2.csv</code>, converted from the team's <code>AI Rubric.xlsx</code>. June's cleaned draft is removed.</li>
   <li><span class="tag decided">Decided</span> <strong>Examples:</strong> <code>rubric_examples_v1.csv</code>, the Notion export of labeled example sentences. 210 Confirmed examples are in the 8 categories now used.</li>
   <li><span class="tag decided">Decided</span> The rubric stays in its own file, so it can be swapped without code changes.</li>
   <li><span class="tag decided">Decided</span> <strong>The materials must line up.</strong> Every question's category needs a rubric row with all 5 levels written. If not, the run stops and lists the problems. <code>python -m src.scoring check</code> runs this check alone.</li>
@@ -286,46 +306,53 @@ Return JSON only:
   <tr><td>Science Technology Medicine</td><td>Examples</td><td>Science, Technology, &amp; Medicine</td></tr>
 </table></div>
 <ul>
-  <li><span class="tag open">Open</span> <strong>Skipped for now:</strong> Education has no rubric row, and Disability has no Medium Bias or High Bias text. Both are in <code>SKIP_CATEGORIES</code>, so their 20 questions are not asked or judged. Fengjiao will ask the rubric team. The code marks this with <code># zfj todo</code>.</li>
+  <li><span class="tag decided">Decided</span> <strong>Done 2026-11-22, was skipped:</strong> Education had no rubric row, and Disability has no Medium Bias or High Bias text. Both are in <code>SKIP_CATEGORIES</code>, so their 20 questions are not asked or judged. Fengjiao will ask the rubric team. The code marks this with <code># zfj todo</code>.</li>
   <li>The rubric's Influence row has no questions or examples, so it is unused.</li>
   <li>Racial Equity has no High Bias examples, so that level is shown with its description only.</li>
 </ul>
 
 <h2>Materials and inputs</h2>
-<p><span class="tag decided">Decided</span> For now, the materials are saved on disk, and each run reads them from there. This is a known shortcut: when a file changes in Drive or Notion, someone has to download it again. The long-term home is Azure.</p>
+<p><span class="tag decided">Decided</span> <strong>Materials come from SQL (2026-11-24, examples added 2026-11-25).</strong> Each run reads the PostgreSQL tables <code>questions</code>, <code>rubrics</code> and <code>rubric_examples</code>. The CSV files stay in Git as the import source: <code>python -m src.scoring import-materials</code> creates the tables and copies in the files named in the config. Only <code>rubric_v3.csv</code> goes into <code>rubrics</code>.</p>
+<ul>
+  <li><span class="tag decided">Decided</span> A version is the file name without <code>.csv</code>. Importing the same content again changes nothing. Changed content under an existing version is refused, so it needs a new file name.</li>
+  <li><span class="tag decided">Decided</span> A run records the version plus a hash of the rows it read, so an edit made directly in SQL is noticeable.</li>
+  <li><span class="tag decided">Decided</span> Category names are saved in the rubric's spelling, so examples join to the rubric. The examples file writes <code>Science Technology Medicine</code>.</li>
+  <li><span class="tag decided">Decided</span> <code>rubric_examples</code> keeps every example in the Notion export with its status (241 Confirmed, 7 Pending Review, 1 empty). A run uses only <code>EXAMPLE_STATUSES</code>, so confirming an example in SQL adds it to the next run. The file's note row, with no category or level, is left out, and so are <code>Has Real Source</code> (always Yes) and <code>Word Count</code>.</li>
+</ul>
 <div class="table-wrap"><table>
   <tr><th>Material</th><th>Local file in <code>src/data/scoring_inputs/</code></th></tr>
-  <tr><td>Question set</td><td><code>question_set_v1.csv</code></td></tr>
-  <tr><td>Rubric</td><td><code>rubric_v2.csv</code></td></tr>
+  <tr><td>Question set</td><td><code>question_set_human_v1.csv</code> (in use), <code>question_set_v1.csv</code> (Zeli's AI-generated set)</td></tr>
+  <tr><td>Rubric</td><td><code>rubric_v3.csv</code> (in use), <code>rubric_v2.csv</code> (previous)</td></tr>
   <tr><td>Rubric examples</td><td><code>rubric_examples_v1.csv</code></td></tr>
 </table></div>
 <ul>
   <li><span class="tag decided">Decided</span> <strong>Location (2026-11-13):</strong> scoring inputs live in <code>src/data/scoring_inputs/</code>, not the top-level <code>data/</code>. They are backend-only, and the Docker image copies only <code>src/</code>, so this keeps them in the deployed app.</li>
   <li><span class="tag decided">Decided</span> <strong>Questions:</strong> <a href="https://docs.google.com/spreadsheets/d/1pKchqKL-uFeWeBLfx1v_lzdLbC8xx68owkgJzII4MiE/edit">Zeli's question set v1</a>. The file has 100 prompts across 10 categories, with neutral, charged and paired types. 80 are used until the two skipped categories have a rubric.</li>
+  <li><span class="tag decided">Decided</span> <strong>Human questions first (2026-11-22).</strong> The run uses <a href="https://docs.google.com/spreadsheets/d/1k4UJgxUC7hskiZwrMdR7YZZx2YOE9Sj-ds8siAPhYqk/edit">Question-Set_Human</a>, converted to <code>question_set_human_v1.csv</code> with columns <code>id, category, type, prompt, source</code>. It has 61 prompts in 10 categories, with IDs like <code>RAC-H1</code>. Prompts are kept word for word, typos included, because that is how real users write. All 61 are asked since rubric v3. The sheet has 5 Sexuality questions and 7 each for Disability and Education, so it is not 6 per category.</li>
+  <li><span class="tag decided">Decided</span> Human questions have no type, so <code>type</code> is empty and the API returns <code>null</code>.</li>
   <li><span class="tag decided">Decided</span> <strong>Models are config, not a file.</strong> The list is <code>CANDIDATE_MODELS</code> in the config, and <code>models.csv</code> is removed.</li>
   <li>Each run records the exact version of all three files it used.</li>
   <li><strong>Scale:</strong> 0 to 1, where higher means more bias, in 5 equal steps. To be validated after the first run.</li>
 </ul>
 
 <h2>Models to rank</h2>
-<p><span class="tag decided">Decided</span> 20 models across 10 providers, all called through the project's Azure APIs. The list is <code>CANDIDATE_MODELS</code> in the config. It is the earlier list of 23 without <code>gpt-5.4-nano</code>, <code>mistral-small-2503</code> and <code>Phi-4</code>, a first cut that Fengjiao can change.</p>
+<p><span class="tag decided">Decided</span> 17 models across 9 providers, all called through the project's Azure APIs. The list is <code>CANDIDATE_MODELS</code> in the config. It is the earlier list of 23 without <code>gpt-5.4-nano</code>, <code>mistral-small-2503</code> and <code>Phi-4</code>, a first cut that Fengjiao can change. On 2026-11-23 three more were dropped: <code>Llama-3.3-70B-Instruct</code> (shared quota full), <code>muse-spark-1.3</code> (not listed in <code>northcentralus</code> or <code>eastus2</code>) and <code>qwen3.8-27b</code> (no deployment option). They stay in the config as comments, so they can come back.</p>
 <div class="table-wrap"><table>
   <tr><th>Provider</th><th>Models</th></tr>
   <tr><td>OpenAI</td><td><code>gpt-6.1-sol</code>, <code>gpt-5.5</code>, <code>gpt-5.4-mini</code>, <code>gpt-oss-120b</code></td></tr>
   <tr><td>Anthropic</td><td><code>claude-fable-5-1</code>, <code>claude-opus-5-5</code>, <code>claude-sonnet-5-5</code>, <code>claude-haiku-5-5</code></td></tr>
-  <tr><td>Meta</td><td><code>Llama-4-Maverick-17B-128E-Instruct-FP8</code>, <code>Llama-3.3-70B-Instruct</code>, <code>muse-spark-1.3</code></td></tr>
+  <tr><td>Meta</td><td><code>Llama-4-Maverick-17B-128E-Instruct-FP8</code></td></tr>
   <tr><td>DeepSeek</td><td><code>DeepSeek-V4-Pro</code>, <code>DeepSeek-V4-Flash</code></td></tr>
   <tr><td>xAI</td><td><code>grok-4.7</code>, <code>grok-4-1-fast-non-reasoning</code></td></tr>
   <tr><td>Mistral AI</td><td><code>Mistral-Large-3</code></td></tr>
   <tr><td>Microsoft</td><td><code>MAI-Thinking-1</code></td></tr>
   <tr><td>MoonshotAI</td><td><code>Kimi-K3.1-Pro</code></td></tr>
-  <tr><td>Alibaba</td><td><code>qwen3.8-27b</code></td></tr>
   <tr><td>Cohere</td><td><code>cohere-command-a</code></td></tr>
 </table></div>
 <div class="table-wrap"><table>
-  <tr><th>Calls in a full run</th><th>80 questions (now)</th><th>100 questions (later)</th></tr>
-  <tr><td>Answers: models × questions × 3</td><td>4,800</td><td>6,000</td></tr>
-  <tr><td>Judgements: answers × 3 judges × 3 orders</td><td>up to 43,200</td><td>up to 54,000</td></tr>
+  <tr><th>Calls in a full run</th><th>61 questions (now)</th><th>100 questions (later)</th></tr>
+  <tr><td>Answers: models × questions × 3</td><td>3,111</td><td>5,100</td></tr>
+  <tr><td>Judgements: answers × 3 judges × 3 orders</td><td>up to 27,999</td><td>up to 45,900</td></tr>
 </table></div>
 <ul>
   <li><span class="tag decided">Decided</span> The cost is accepted, because a model is ranked once. Adding one model later is 300 answers and 2,700 judgements.</li>
@@ -333,7 +360,7 @@ Return JSON only:
   <li><span class="tag decided">Decided</span> <strong>Effort settings (2026-11-13).</strong> The same model at a different effort setting counts as a different entry, and scores are never averaged across settings. For v1, each model is ranked at one setting only, the provider default.</li>
   <li><code>Model</code> has an <code>effort</code> field that is saved with each run. It is a record only for now: the engine does not yet pass it to the model call.</li>
   <li><span class="tag open">Open</span> Confirm the list with Zeli, who also had a model list to-do.</li>
-  <li><span class="tag open">Open</span> Get access to the project's Azure account, then confirm each model name matches its deployment and test it with one real call.</li>
+  <li><span class="tag open">Open</span> In <code>forge-bias-in-language-rg</code>, confirm each model name matches its deployment and test it with one real call.</li>
 </ul>
 
 <h2>Failed calls <span class="tag decided">Decided</span></h2>
@@ -366,45 +393,75 @@ Return JSON only:
 </ul>
 
 <h2>Database</h2>
-<p><span class="tag decided">Decided</span> Hosted PostgreSQL. Questions aren't a table for now because they stay in the CSV, so answers store the question ID as plain text.</p>
-<svg class="d" viewBox="0 0 680 272" role="img" aria-label="Runs and models connect to answers. Each answer has many judgements. Judgements merge into one answer label, and labels roll up into model scores, which the ranking API reads.">
-  <g class="g"><rect x="20" y="20" width="190" height="96" rx="8"/><text class="h" x="115" y="44">runs</text><text x="115" y="68">id, status, date</text><text x="115" y="88">question set, settings</text></g>
-  <line class="arr" x1="210" y1="68" x2="243" y2="68"/>
-  <g class="p"><rect x="245" y="20" width="190" height="96" rx="8"/><text class="h" x="340" y="44">answers</text><text x="340" y="68">run, model, question</text><text x="340" y="88">attempt, text, time</text></g>
-  <line class="arr" x1="435" y1="68" x2="468" y2="68"/>
-  <g class="p"><rect x="470" y="20" width="190" height="96" rx="8"/><text class="h" x="565" y="44">judgements</text><text x="565" y="68">answer, judge, order</text><text x="565" y="88">label, reason, time</text></g>
-  <g class="g"><rect x="20" y="156" width="190" height="96" rx="8"/><text class="h" x="115" y="180">models</text><text x="115" y="204">name</text><text x="115" y="224">provider, effort</text></g>
-  <path class="arr" d="M210 204 H228 V88 H243"/>
-  <line class="arr" x1="565" y1="116" x2="565" y2="154"/>
-  <g class="p"><rect x="470" y="156" width="190" height="96" rx="8"/><text class="h" x="565" y="180">answer_labels</text><text x="565" y="204">answer, merged label</text><text x="565" y="224">score, merge method</text></g>
-  <line class="arr" x1="470" y1="204" x2="437" y2="204"/>
-  <g class="t"><rect x="245" y="156" width="190" height="96" rx="8"/><text class="h" x="340" y="180">model_scores</text><text x="340" y="204">run, model, score</text><text x="340" y="224">rank, merge method</text></g>
+<p><span class="tag decided">Decided</span> Hosted PostgreSQL. Three tables hold the materials (2026-11-25). Answers store the question ID as plain text.</p>
+<div class="table-wrap"><table>
+  <tr><th>Table</th><th>One row is</th><th>Columns</th><th>Rows</th></tr>
+  <tr><td><code>questions</code></td><td>One question in one version</td><td><code>version</code>, <code>id</code>, <code>position</code>, <code>category</code>, <code>type</code>, <code>prompt</code>, <code>source</code></td><td>61</td></tr>
+  <tr><td><code>rubrics</code></td><td>One category's text for one level, in one version</td><td><code>version</code>, <code>category</code>, <code>level</code>, <code>description</code></td><td>55</td></tr>
+  <tr><td><code>rubric_examples</code></td><td>One labeled example sentence, in one version</td><td><code>version</code>, <code>position</code>, <code>category</code>, <code>level</code>, <code>text</code>, <code>status</code>, <code>contributor</code>, <code>source</code></td><td>249</td></tr>
+</table></div>
+<p><span class="tag decided">Decided</span> <strong>One log table for results (2026-11-25).</strong> Fengjiao wanted fewer tables, so the six result tables (<code>runs</code>, <code>models</code>, <code>answers</code>, <code>judgements</code>, <code>answer_labels</code>, <code>model_scores</code>) are replaced by one append-only table, <code>log</code>. They had been created on Azure by mistake on 2026-11-25 and were dropped while empty. Every step of a run adds rows, and nothing is changed or deleted. <code>python -m src.scoring export --run-id N</code> writes a run's rows to a CSV file for analysis in Excel or pandas.</p>
+<svg class="d" viewBox="0 0 680 150" role="img" aria-label="A run adds rows of six kinds to one log table: run, answer, judgement, label, score and publish. Export writes them to CSV, and the ranking API reads the newest publish row.">
+  <g class="g"><rect x="20" y="20" width="96" height="44" rx="8"/><text class="h" x="68" y="42">run</text></g>
+  <line class="arr" x1="116" y1="42" x2="128" y2="42"/>
+  <g class="p"><rect x="130" y="20" width="96" height="44" rx="8"/><text class="h" x="178" y="42">answer</text></g>
+  <line class="arr" x1="226" y1="42" x2="238" y2="42"/>
+  <g class="p"><rect x="240" y="20" width="96" height="44" rx="8"/><text class="h" x="288" y="42">judgement</text></g>
+  <line class="arr" x1="336" y1="42" x2="348" y2="42"/>
+  <g class="p"><rect x="350" y="20" width="96" height="44" rx="8"/><text class="h" x="398" y="42">label</text></g>
+  <line class="arr" x1="446" y1="42" x2="458" y2="42"/>
+  <g class="p"><rect x="460" y="20" width="96" height="44" rx="8"/><text class="h" x="508" y="42">score</text></g>
+  <line class="arr" x1="556" y1="42" x2="568" y2="42"/>
+  <g class="t"><rect x="570" y="20" width="96" height="44" rx="8"/><text class="h" x="618" y="42">publish</text></g>
+  <rect class="box" x="10" y="10" width="666" height="64" rx="10"/>
+  <text x="343" y="88">all rows in one table: log</text>
+  <g class="g"><rect x="130" y="104" width="206" height="36" rx="8"/><text x="233" y="122">export → CSV, every kind</text></g>
+  <g class="t"><rect x="460" y="104" width="206" height="36" rx="8"/><text x="563" y="122">GET /api/rankings</text></g>
+  <line class="arr" x1="618" y1="64" x2="618" y2="102"/>
 </svg>
 <div class="table-wrap"><table>
-  <tr><th>Table</th><th>One row is</th><th>Rows per full run (80 questions)</th></tr>
-  <tr><td><code>runs</code></td><td>One scoring run, with a copy of its settings</td><td>1</td></tr>
-  <tr><td><code>models</code></td><td>One ranked model</td><td>20 (kept across runs)</td></tr>
-  <tr><td><code>answers</code></td><td>One model's answer to one question, one attempt</td><td>4,800</td></tr>
-  <tr><td><code>judgements</code></td><td>One judge's label and reason for one answer, in one prompt order</td><td>up to 43,200, plus any re-judging</td></tr>
-  <tr><td><code>answer_labels</code></td><td>One answer's merged label from one calculation</td><td>4,800 per calculation</td></tr>
-  <tr><td><code>model_scores</code></td><td>One model's final score and rank from one calculation</td><td>20 per calculation</td></tr>
+  <tr><th><code>kind</code></th><th>One row is</th><th>Columns it fills</th><th>Rows per full run (61 questions)</th></tr>
+  <tr><td><code>run</code></td><td>One run, with a copy of its settings and the materials versions</td><td><code>details</code></td><td>1</td></tr>
+  <tr><td><code>answer</code></td><td>One model's answer to one question, one attempt</td><td><code>model</code>, <code>question_id</code>, <code>category</code>, <code>attempt</code>, <code>status</code>, <code>text</code>, <code>error</code></td><td>3,111, plus retries</td></tr>
+  <tr><td><code>judgement</code></td><td>One judge's level and reason for one answer, in one prompt order</td><td>the answer's columns, <code>judge</code>, <code>prompt_order</code>, <code>level</code>, <code>text</code> (reason); rubric and examples versions in <code>details</code></td><td>up to 26,352, plus retries and re-judging</td></tr>
+  <tr><td><code>label</code></td><td>One answer's merged level, from one calculation</td><td>the answer's columns, <code>level</code>, <code>score</code>; merge method and vote count in <code>details</code></td><td>up to 3,111 per calculation</td></tr>
+  <tr><td><code>score</code></td><td>One model's score and rank, from one calculation</td><td><code>model</code>, <code>score</code>; rank, answer counts, provider and effort in <code>details</code></td><td>17 per calculation</td></tr>
+  <tr><td><code>publish</code></td><td>The ranking the website shows</td><td><code>details</code> (the <code>/api/rankings</code> JSON)</td><td>1 per publish</td></tr>
+</table></div>
+<p>Columns: <code>id</code>, <code>run_id</code>, <code>kind</code>, <code>model</code>, <code>question_id</code>, <code>category</code>, <code>attempt</code>, <code>judge</code>, <code>prompt_order</code>, <code>level</code>, <code>score</code>, <code>status</code>, <code>text</code>, <code>error</code>, <code>details</code> (JSON), <code>created_at</code>. A column a kind doesn't use stays empty.</p>
+<ul>
+  <li><span class="tag decided">Decided</span> The newest row counts. A retried call or a re-judging adds a row, the old one stays, and the newest successful row for each answer, judge and order is the current one.</li>
+  <li><span class="tag decided">Decided</span> The database still checks what it can without links between tables: each kind must fill its columns, a run has one <code>run</code> row, and an answer can succeed only once per attempt.</li>
+  <li><span class="tag decided">Decided</span> <strong>Publishing saves a copy.</strong> <code>publish</code> stores the finished ranking JSON, and <code>/api/rankings</code> returns the newest one. Re-judging or re-merging a published run no longer changes the website until someone publishes again.</li>
+  <li><span class="tag decided">Decided</span> Category scores use the category saved with each answer, not today's question file.</li>
+  <li><span class="tag decided">Decided</span> Run IDs count up from 1. Every row records its time.</li>
+  <li><span class="tag decided">Decided</span> The export writes one CSV per run to <code>exports/azure_run_&lt;id&gt;.csv</code>, which Git ignores. <code>--kind</code> exports one kind only. The columns are fixed: the log columns, then <code>rank</code>, <code>scored</code>, <code>blocked</code>, <code>failed</code>, <code>provider</code>, <code>effort</code>, <code>merge_method</code>, <code>judgement_count</code>, <code>rubric_version</code>, <code>examples_version</code>, and <code>details</code> as JSON for the rest, such as a run's settings.</li>
+</ul>
+<h3>Local runs: <code>--debug</code> <span class="tag decided">Decided</span></h3>
+<p><span class="tag decided">Decided</span> <strong>A run on a laptop never writes to the database (2026-11-25).</strong> Fengjiao's rule: local runs are tests, so only runs on Azure write the <code>log</code> table.</p>
+<div class="table-wrap"><table>
+  <tr><th>Command</th><th>Where it runs</th><th>Log goes to</th></tr>
+  <tr><td><code>python -m src.scoring run --debug</code></td><td>Anywhere</td><td><code>exports/run_&lt;id&gt;.csv</code> on that computer</td></tr>
+  <tr><td><code>python -m src.scoring run</code></td><td>Azure (Container App or job)</td><td>The <code>log</code> table</td></tr>
+  <tr><td><code>python -m src.scoring run</code></td><td>A laptop</td><td>Nothing: it stops and says to add <code>--debug</code></td></tr>
 </table></div>
 <ul>
-  <li><span class="tag decided">Decided</span> Every answer and every judgement is recorded with a timestamp. A judgement also records the rubric and examples versions it used.</li>
-  <li><span class="tag decided">Decided</span> Nothing is overwritten. Re-judging adds new rows, the old rows stay, and the newest successful row for each answer, judge and order is the current one.</li>
-  <li>Keeping answers, judgements and merged labels apart lets us re-judge with a new rubric without asking the models again, and re-merge without calling any model.</li>
-  <li>Question scores are calculated when needed, so they aren't stored twice.</li>
-  <li><code>GET /api/rankings</code> reads the newest <code>model_scores</code> for the latest published run. Its output is unchanged.</li>
+  <li><span class="tag decided">Decided</span> <code>--debug</code> works on <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>publish</code> and <code>export</code>. Materials are read from SQL either way.</li>
+  <li><span class="tag decided">Decided</span> The local file has the same rows and columns as the export, so the same analysis works on both. One file per run, appended as the run goes, so a stopped run continues from the file.</li>
+  <li><span class="tag decided">Decided</span> A run counts as on Azure when <code>CONTAINER_APP_JOB_NAME</code> or <code>CONTAINER_APP_NAME</code> is set, which Azure sets inside Container Apps. Reading the log (<code>show</code>, <code>export</code>) works from a laptop.</li>
+  <li><span class="tag open">Open</span> Check that the scoring job sets <code>CONTAINER_APP_JOB_NAME</code> once the job exists.</li>
+  <li><span class="tag decided">Decided</span> A local <code>publish</code> adds a publish row to the file only. The website reads the database, so it does not change.</li>
 </ul>
 
 <h2>Open questions</h2>
 <div class="table-wrap"><table>
   <tr><th>Question</th><th>Options</th></tr>
   <tr><td>Where is PostgreSQL hosted, and who sets it up?</td><td>Azure is the first option to check. The team needs to confirm the host and an owner.</td></tr>
-  <tr><td>How do we get access to the project's Azure account?</td><td>Not "Azure 2 for MSAI". Fengjiao expects access back on 2026-11-18. Then re-check the model list there.</td></tr>
+  <tr><td><span class="tag decided">Decided</span> Which Azure resource group does the project use?</td><td><code>forge-bias-in-language-rg</code>, in <code>northcentralus</code> (2026-11-23). It is in the subscription "Azure 2 for MSAI", so the earlier note that the project does not use that subscription no longer holds. The model list was re-checked there the same day.</td></tr>
   <tr><td>Which 3 models are the real judges?</td><td>The config holds placeholders. Decide before the first real run.</td></tr>
-  <tr><td>When do Education and Disability get a full rubric?</td><td>Fengjiao to ask the rubric team. Then remove them from <code>SKIP_CATEGORIES</code>.</td></tr>
-  <tr><td>When votes split evenly, which label wins?</td><td>Now the more biased one. The other choice is the less biased one.</td></tr>
+  <tr><td>When votes split evenly, which label wins?</td><td>Now the more biased one. <strong>The mock run shows this is not neutral:</strong> with random labels, the 3 judge models scored 0.66 to 0.72 while every other model scored 0.48 to 0.55. A judge model's answers get only 2 judges, and taking the more biased of 2 medians pushes its score up. Options: pick judges that are not ranked, average the two middle labels, or let judges judge themselves.</td></tr>
+  <tr><td>Which way does rank run?</td><td>This PRD says rank 1 is the most biased. The ranking website puts the lowest score first. One of the two must change.</td></tr>
+  <tr><td><span class="tag decided">Decided</span> Question text used to be read from today's file, not saved with the run.</td><td>Done 2026-11-25: questions are saved in SQL by version, each run records the version and a hash of its rows, and each answer row saves its category.</td></tr>
   <tr><td>Should the effort setting be passed to the model call?</td><td>Needed only when the same model is ranked at more than one setting.</td></tr>
 </table></div>
 

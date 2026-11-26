@@ -16,7 +16,7 @@ from src.scoring.config import (
 )
 from src.scoring.judge import build_prompt, parse_judgement
 from src.scoring.schema import Materials, Model
-from src.scoring.store import ScoringStore
+from src.scoring.store import LogStore
 
 REFUSAL_ANSWER = "[The model refused to answer.]"
 
@@ -68,7 +68,7 @@ def _short_error(exc: Exception) -> str:
 
 
 def ask_models(
-    store: ScoringStore,
+    store: LogStore,
     run_id: int,
     models: list[Model],
     materials: Materials,
@@ -87,7 +87,9 @@ def ask_models(
 
     def ask(task) -> None:
         model_name, question, attempt = task
-        save = lambda **fields: store.save_answer(run_id, model_name, question.id, attempt, **fields)
+        save = lambda **fields: store.save_answer(
+            run_id, model_name, question.id, attempt, category=question.category, **fields
+        )
         try:
             text = with_retries(
                 lambda: _require_text(complete(model_name, question.prompt, ANSWER_MAX_TOKENS, ANSWER_TEMPERATURE, None)),
@@ -106,7 +108,7 @@ def ask_models(
 
 
 def judge_answers(
-    store: ScoringStore,
+    store: LogStore,
     run_id: int,
     materials: Materials,
     config: ScoringConfig,
@@ -128,7 +130,7 @@ def judge_answers(
         for judge in config.judge_models
         if not (config.exclude_self_judging and judge == answer.model_name)
         for order in config.judge_orders
-        if (answer.answer_id, judge, order) not in finished
+        if (answer.key, judge, order) not in finished
     ]
 
     def judge_one(task) -> None:
@@ -144,7 +146,7 @@ def judge_answers(
             config.lettered_order,
         )
         save = lambda **fields: store.add_judgement(
-            answer.answer_id, judge, order, materials.versions["rubric"], materials.versions["examples"], **fields
+            run_id, answer, judge, order, materials.versions["rubric"], materials.versions["examples"], **fields
         )
 
         def call() -> tuple[str, str]:

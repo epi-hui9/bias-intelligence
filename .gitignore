@@ -73,3 +73,9 @@ notebooks/
 .github/
 chroma_db/
 gss_questions.json
+
+# Local PostgreSQL for testing (pgserver)
+.pgdata/
+
+# Scoring run exports (python -m src.scoring export)
+exports/
