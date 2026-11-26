@@ -1,22 +1,26 @@
 """Command line for the scoring engine. Run from the repo root.
 
-    python -m src.scoring init-db                   # create the results log table
+    python -m src.scoring init-db                   # create the log and rankings tables
     python -m src.scoring import-materials          # copy the questions, rubric and examples files into SQL
     python -m src.scoring check                     # check the materials line up, without calling a model
-    python -m src.scoring run
+    python -m src.scoring run                       # ask, judge, score, then write the ranking
+    python -m src.scoring run --llm azure           # the same with real models (default: LLM_MODE)
     python -m src.scoring run --run-id 3            # finish a stopped run
     python -m src.scoring rejudge --run-id 3        # judge every answer again with the current rubric
     python -m src.scoring merge --run-id 3          # re-merge saved judgements with the current MERGE_METHOD
     python -m src.scoring show --run-id 3
-    python -m src.scoring publish --run-id 3        # show this run on the website
     python -m src.scoring export --run-id 3         # write the run's log to exports/azure_run_3.csv
 
-On your computer, add --debug to run, rejudge, merge, show, publish or export:
+`run`, `rejudge` and `merge` end by writing the ranking to the rankings table,
+which GET /api/rank_db reads. On your computer, add --debug to run, rejudge,
+merge, show or export:
 
     python -m src.scoring run --limit-questions 3 --debug
 
-A --debug command writes the log to exports/run_<id>.csv and never to the
-database. Without --debug, a command that writes the log runs only on Azure.
+A --debug command writes the log to exports/run_<id>.csv and the ranking to
+exports/run_<id>_rankings.csv, and never to the database. It also writes a log
+file, src/logs/<date>.log, with every prompt sent to a model and its response;
+files older than 7 days are deleted. Online, no log file is written. Without --debug, a command that writes the log runs only on Azure.
 Either way, the questions, rubric and examples are read from SQL.
 
 Settings live in src/scoring/config.py.
@@ -24,22 +28,31 @@ Settings live in src/scoring/config.py.
 
 import argparse
 import os
+import sys
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 from src.config import DATABASE_URL
 from src.llm.azure_openai_client import openai_client
+from src.scoring import debug_log
 from src.scoring.config import ScoringConfig
+from src.scoring.debug_log import logger
 from src.scoring.loaders import import_from_disk, load_materials
 from src.scoring.mock_llm import mock_complete
 from src.scoring.runner import ask_models, azure_complete, judge_answers
 from src.scoring.store import CsvLog, LogStore, SqlLog
 
 
+def say(message: str) -> None:
+    """Print a message, and with --debug also write it to the log file."""
+    print(message)
+    logger.info(message)
+
+
 def _show(store: LogStore, run_id: int) -> None:
     for row in store.run_rankings(run_id):
-        print(
+        say(
             f"{row['rank']:>3}  {row['score']:.4f}  {row['model']}  "
             f"(scored {row['scored']}, blocked {row['blocked']}, failed {row['failed']})"
         )
@@ -48,6 +61,24 @@ def _show(store: LogStore, run_id: int) -> None:
 def _calculate(store: LogStore, run_id: int, config: ScoringConfig) -> None:
     store.calculate(run_id, config.merge_method, config.judge_models, config.judge_orders)
     _show(store, run_id)
+
+
+def _finish(store: LogStore, run_id: int, config: ScoringConfig) -> bool:
+    """Score the run, print the ranking, then write it unless calls failed. Return True if written."""
+    _calculate(store, run_id, config)
+    failed = store.failed_calls(run_id)
+    if any(failed.values()) and not config.publish_if_calls_failed:
+        say(
+            f"Ranking not written: {failed['answers']} answer calls and {failed['judgements']} judge calls failed. "
+            f"Retry them with: python -m src.scoring run --run-id {run_id}"
+            + (" --debug" if hasattr(store.log, "rankings_path") else "")
+        )
+        return False
+    store.publish(run_id)
+    local = hasattr(store.log, "rankings_path")
+    where = store.log.rankings_path(run_id) if local else "the rankings table (GET /api/rank_db)"
+    say(f"Ranking written to {where}.")
+    return True
 
 
 def _check(config: ScoringConfig) -> None:
@@ -62,7 +93,7 @@ def _check(config: ScoringConfig) -> None:
 
 
 # Commands that add rows to the log.
-WRITES_LOG = {"run", "rejudge", "merge", "publish"}
+WRITES_LOG = {"run", "rejudge", "merge"}
 
 
 def on_azure() -> bool:
@@ -74,7 +105,7 @@ def on_azure() -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m src.scoring", description="Bias scoring engine")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init-db", help="Create the results log table")
+    commands.add_parser("init-db", help="Create the log and rankings tables")
     commands.add_parser("import-materials", help="Create the questions, rubrics and rubric_examples tables and copy the files into them")
     commands.add_parser("check", help="Check the materials line up and print the size of a run")
 
@@ -91,17 +122,22 @@ def main() -> None:
         ("rejudge", "Judge every answer of a run again with the current rubric and examples"),
         ("merge", "Re-merge a run's saved judgements with the current merge method"),
         ("show", "Print a run's ranking"),
-        ("publish", "Show a run on the website"),
     ):
         command = commands.add_parser(name, parents=[debug], help=help_text)
         command.add_argument("--run-id", type=int, required=True)
     export = commands.add_parser("export", parents=[debug], help="Write a run's log rows to a CSV file")
     export.add_argument("--run-id", type=int, required=True)
-    export.add_argument("--kind", help="Only rows of this kind: run, answer, judgement, label, score or publish")
+    export.add_argument("--kind", help="Only rows of this kind: run, answer, judgement, label or score")
     export.add_argument("--out", type=Path, help="The CSV file to write. Default: exports/azure_run_<id>[_<kind>].csv")
+
+    # Mock or real models, for this command only.
+    for command in (run, commands.choices["rejudge"]):
+        command.add_argument("--llm", choices=["mock", "azure"], help="Override LLM_MODE in config.py")
 
     args = parser.parse_args()
     config = ScoringConfig()
+    if getattr(args, "llm", None):
+        config = replace(config, llm_mode=args.llm)
     try:
         if args.command == "import-materials":
             for table, result in import_from_disk(DATABASE_URL).items():
@@ -116,6 +152,9 @@ def main() -> None:
                 "This computer is not on Azure, so this command must not write to the database. "
                 "Add --debug to write the log to exports/run_<id>.csv instead."
             )
+        if local and args.command != "export":
+            print(f"Debug log file: {debug_log.start()}")
+            logger.info("command: python -m src.scoring %s", " ".join(sys.argv[1:]))
         store = LogStore(CsvLog() if local else SqlLog(DATABASE_URL))
         if args.command in {"run", "rejudge"}:
             if config.llm_mode == "azure":
@@ -124,15 +163,17 @@ def main() -> None:
             elif config.llm_mode != "mock":
                 raise ValueError(f"Unknown LLM_MODE {config.llm_mode!r}. Choose 'azure' or 'mock'.")
             else:
-                print("LLM_MODE is 'mock': no real model is called.")
+                say("LLM_MODE is 'mock': no real model is called.")
             complete = azure_complete if config.llm_mode == "azure" else mock_complete
+            if local:
+                complete = debug_log.logged(complete)
             materials = load_materials()
     except ValueError as exc:
         parser.error(str(exc))
 
     if args.command == "init-db":
         store.init_schema()
-        print("The log table is ready.")
+        print("The log and rankings tables are ready.")
         return
     if args.command != "run" or args.run_id:
         if store.run_status(args.run_id) is None:
@@ -149,27 +190,17 @@ def main() -> None:
                 parser.error(f"Not in CANDIDATE_MODELS: {sorted(unknown)}")
             models = [model for model in models if model.name in wanted]
         run_id = args.run_id or store.create_run(materials.versions["questions"], config.snapshot())
-        print(f"Run {run_id}" + (f", local log: {store.log.path(run_id)}" if local else ""))
+        say(f"Run {run_id}" + (f", local log: {store.log.path(run_id)}" if local else ""))
         ask_models(store, run_id, models, materials, config, complete=complete)
         judge_answers(store, run_id, materials, config, complete=complete)
-        _calculate(store, run_id, config)
-        print(f"Review the ranking, then publish it with: python -m src.scoring publish --run-id {run_id}")
+        _finish(store, run_id, config)
     elif args.command == "rejudge":
         judge_answers(store, args.run_id, materials, config, complete=complete, rejudge=True)
-        _calculate(store, args.run_id, config)
+        _finish(store, args.run_id, config)
     elif args.command == "merge":
-        _calculate(store, args.run_id, config)
+        _finish(store, args.run_id, config)
     elif args.command == "show":
         _show(store, args.run_id)
-    elif args.command == "publish":
-        try:
-            store.publish(args.run_id)
-        except ValueError as exc:
-            parser.error(str(exc))
-        if local:
-            print(f"Run {args.run_id}: publish row added to {store.log.path(args.run_id)}. The website is not changed.")
-        else:
-            print(f"Run {args.run_id} is now the published ranking.")
     elif args.command == "export":
         if local and not args.kind and not args.out:
             print(f"The local log already is a CSV file: {store.log.path(args.run_id)}")

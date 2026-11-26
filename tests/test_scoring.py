@@ -1,8 +1,10 @@
 import csv
 import json
+import logging
 import os
 import re
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 import unittest
 from dataclasses import replace
@@ -23,6 +25,7 @@ from src.scoring.merge import AnswerOutcome, merge, rank_models
 from src.scoring.runner import BlockedError, RefusedError, ask_models, judge_answers, with_retries
 from src.scoring.schema import LEVELS, Example, Judgement, Materials, Model, Question, RubricRow
 from src.scoring import __main__ as cli
+from src.scoring import debug_log
 from src.scoring.store import CSV_COLUMNS, KINDS, CsvLog, LogStore, SqlLog
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -549,14 +552,13 @@ class EngineTests:
                 rows = list(reader)
             self.assertEqual(tuple(reader.fieldnames), CSV_COLUMNS)
             self.assertEqual(written, len(rows))
-            self.assertEqual(len(rows), 1 + 18 + 144 + 18 + 3 + 1)
+            self.assertEqual(len(rows), 1 + 18 + 144 + 18 + 3)
             self.assertEqual(rows[0]["kind"], "run")
             self.assertEqual(json.loads(rows[0]["details"])["judge_models"], ["gpt-5.5", "judge-b", "judge-c"])
             score = next(row for row in rows if row["kind"] == "score" and row["model"] == "model-b")
             self.assertEqual((score["rank"], score["score"], score["provider"]), ("1", "0.75", "B"))
             judgement = next(row for row in rows if row["kind"] == "judgement")
             self.assertEqual((judgement["category"], judgement["text"], judgement["rubric_version"]), ("Cat", "Because.", "r#1"))
-            self.assertEqual(json.loads(rows[-1]["details"])["models"][0]["modelName"], "model-b")
 
             self.assertEqual(self.store.export(run_id, path, kind="score"), 3)
             with self.assertRaisesRegex(ValueError, "Unknown kind"):
@@ -566,7 +568,7 @@ class EngineTests:
 @unittest.skipUnless(TEST_DATABASE_URL, "Set TEST_DATABASE_URL to run PostgreSQL tests")
 class SqlEngineTests(EngineTests, unittest.TestCase):
     def make_store(self):
-        self.sql("DROP TABLE IF EXISTS log, model_scores, answer_labels, judgements, answers, models, runs")
+        self.sql("DROP TABLE IF EXISTS log, rankings, model_scores, answer_labels, judgements, answers, models, runs")
         store = LogStore(SqlLog(TEST_DATABASE_URL))
         store.init_schema()
         return store
@@ -580,13 +582,32 @@ class SqlEngineTests(EngineTests, unittest.TestCase):
         with patch.object(fastapi_app, "DATABASE_URL", TEST_DATABASE_URL):
             return TestClient(app).get("/api/rankings")
 
-    def test_the_api_returns_the_newest_published_copy(self):
-        self.assertEqual(self.api_get().status_code, 404)
+    def api_get_path(self, path):
+        with patch.object(fastapi_app, "DATABASE_URL", TEST_DATABASE_URL):
+            return TestClient(app).get(path)
+
+    def test_rank_db_returns_the_newest_rankings_rows_and_the_old_routes_match(self):
+        self.assertEqual(self.api_get_path("/api/rank_db").status_code, 404)
         run_id = self.run_engine()
         self.store.publish(run_id)
-        response = self.api_get()
+        response = self.api_get_path("/api/rank_db")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), self.published())
+        for old in ("/api/rankings", "/rankings"):
+            self.assertEqual(self.api_get_path(old).json(), response.json())
+        saved = self.sql("SELECT rank, model_name, label, category_scores, llm_mode FROM rankings ORDER BY rank")
+        self.assertEqual(saved[0], (1, "model-b", "High Bias", {"cat": 0.75}, self.config.llm_mode))
+        self.assertEqual(len(saved), 3)
+
+    def test_a_new_write_adds_rows_and_the_api_returns_the_newest(self):
+        run_id = self.run_engine()
+        self.store.publish(run_id)
+        self.levels["model-c"] = "Very High Bias"
+        judge_answers(self.store, run_id, self.materials, self.config, complete=self.complete, rejudge=True)
+        self.calculate(run_id)
+        self.store.publish(run_id)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM rankings"), [(6,)])
+        self.assertEqual(self.api_get_path("/api/rank_db").json()["models"][0]["modelName"], "model-c")
 
     def test_each_run_has_one_run_row(self):
         self.store.create_run("q#1")
@@ -628,7 +649,89 @@ class CsvEngineTests(EngineTests, unittest.TestCase):
     def test_rows_read_back_from_the_file_equal_the_rows_written(self):
         self.store.publish(self.run_engine())
         written = self.store.log.read()
-        self.assertEqual(LogStore(CsvLog(Path(self.folder.name))).log.read(), written)
+        reopened = CsvLog(Path(self.folder.name))
+        self.assertEqual(reopened.read(), written)
+        self.assertEqual(reopened.latest_rankings(), self.store.log.latest_rankings())
+        self.assertEqual(sorted(p.name for p in Path(self.folder.name).iterdir()), ["run_1.csv", "run_1_rankings.csv"])
+
+
+class FinishTests(unittest.TestCase):
+    """The pipeline's last step: write the ranking unless calls failed."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.store = LogStore(CsvLog(Path(self.folder.name)))
+        self.config = ScoringConfig(models=(Model("m", "P"),), judge_models=("j1", "j2", "j3"), workers=2,
+                                    retry_base_seconds=0)
+        self.materials = small_materials()
+
+    def run_with(self, fail_judge=None):
+        def complete(model, prompt, max_tokens, temperature, schema):
+            if schema is None:
+                return "An answer"
+            if model == fail_judge:
+                raise RuntimeError("timeout")
+            return json.dumps({"label": schema["properties"]["label"]["enum"][0], "reason": "r"})
+        run_id = self.store.create_run("q#1", self.config.snapshot())
+        ask_models(self.store, run_id, list(self.config.models), self.materials, self.config, complete=complete)
+        judge_answers(self.store, run_id, self.materials, self.config, complete=complete)
+        return run_id
+
+    def test_a_clean_run_writes_the_ranking(self):
+        run_id = self.run_with()
+        with patch("sys.stdout"):
+            self.assertTrue(cli._finish(self.store, run_id, self.config))
+        self.assertEqual(self.store.run_status(run_id), "published")
+
+    def test_failed_calls_stop_the_ranking_unless_the_setting_allows_it(self):
+        run_id = self.run_with(fail_judge="j3")
+        self.assertEqual(self.store.failed_calls(run_id), {"answers": 0, "judgements": 18})
+        with patch("sys.stdout"):
+            self.assertFalse(cli._finish(self.store, run_id, self.config))
+            self.assertIsNone(self.store.published_ranking())
+            self.assertTrue(cli._finish(self.store, run_id, replace(self.config, publish_if_calls_failed=True)))
+        self.assertIsNotNone(self.store.published_ranking())
+
+
+class DebugLogTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(self.close_files)
+
+    def close_files(self):
+        for handler in [h for h in debug_log.logger.handlers if isinstance(h, logging.FileHandler)]:
+            debug_log.logger.removeHandler(handler)
+            handler.close()
+
+    def test_files_from_7_days_ago_or_earlier_are_deleted(self):
+        today = date(2026, 11, 25)
+        for day in (1, 6, 7, 8, 30):
+            (self.folder / f"{(today - timedelta(days=day)).isoformat()}.log").write_text("old")
+        (self.folder / "notes.txt").write_text("not a log")
+        path = debug_log.start(self.folder, keep_days=7, today=today)
+        self.assertEqual(path.name, "2026-11-25.log")
+        # Kept: today and the 6 days before it (7 days). Deleted: 7, 8 and 30 days ago.
+        self.assertEqual(
+            sorted(p.name for p in self.folder.iterdir()),
+            ["2026-11-19.log", "2026-11-24.log", "2026-11-25.log", "notes.txt"],
+        )
+
+    def test_every_prompt_response_and_error_is_written(self):
+        path = debug_log.start(self.folder)
+        def complete(model, prompt, max_tokens, temperature, schema):
+            if "fail" in prompt:
+                raise RuntimeError("timeout")
+            return f"reply to {prompt}"
+        call = debug_log.logged(complete)
+        self.assertEqual(call("m", "PROMPT ONE", 10, 0.5, None), "reply to PROMPT ONE")
+        with self.assertRaises(RuntimeError):
+            call("j", "please fail", 10, 0.0, {"type": "object"})
+        text = path.read_text()
+        for expected in ("call 1 answer model=m max_tokens=10 temperature=0.5", "--- prompt ---\nPROMPT ONE",
+                         "--- response ---\nreply to PROMPT ONE", "call 2 judge model=j", "please fail",
+                         "RuntimeError: timeout"):
+            self.assertIn(expected, text)
 
 
 class DebugFlagTests(unittest.TestCase):
@@ -640,7 +743,7 @@ class DebugFlagTests(unittest.TestCase):
             cli.main()
 
     def test_a_command_that_writes_the_log_stops_off_azure_without_debug(self):
-        for argv in (["run"], ["rejudge", "--run-id", "1"], ["merge", "--run-id", "1"], ["publish", "--run-id", "1"]):
+        for argv in (["run"], ["rejudge", "--run-id", "1"], ["merge", "--run-id", "1"]):
             with patch.object(cli, "SqlLog", side_effect=AssertionError("must not touch the database")), \
                     patch("sys.stderr"), self.assertRaises(SystemExit):
                 self.main(*argv)
@@ -653,18 +756,39 @@ class DebugFlagTests(unittest.TestCase):
                 patch.object(cli, "ScoringConfig", lambda: ScoringConfig(llm_mode="mock", models=(Model("m", "P"),),
                                                                          judge_models=("j1", "j2", "j3"), workers=2)), \
                 patch("sys.stdout"):
-            self.main("run", "--debug")
-            self.main("publish", "--run-id", "1", "--debug")
+            with patch.object(debug_log, "LOG_DIR", Path(folder) / "logs"):
+                self.main("run", "--debug")
             rows = CsvLog(Path(folder)).read(1)
+            log_text = next((Path(folder) / "logs").glob("*.log")).read_text()
+            # One command: the ranking is written at the end, with no publish step.
+            ranking = CsvLog(Path(folder)).latest_rankings()
         self.assertEqual({row["kind"] for row in rows}, set(KINDS))
+        self.assertEqual([(r["rank"], r["model_name"], r["llm_mode"]) for r in ranking], [(1, "m", "mock")])
+        # The log file has the command, each prompt sent and the ranking.
+        self.assertIn("command: python -m src.scoring run --debug", log_text)
+        self.assertIn("--- prompt ---\nQuestion 1?", log_text)
+        self.assertIn("Ranking written to", log_text)
+        self.assertEqual(log_text.count(" answer model=m "), 6)
+
+    def test_llm_flag_overrides_the_config_for_one_command(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(cli, "CsvLog", lambda: CsvLog(Path(folder))), \
+                patch.object(cli, "openai_client", side_effect=ValueError("AZURE_API_KEY missing")), \
+                patch.object(cli, "load_materials", return_value=small_materials()), \
+                patch("sys.stderr"), patch("sys.stdout"):
+            with self.assertRaises(SystemExit):  # azure: checks the keys first
+                self.main("run", "--debug", "--llm", "azure")
+            self.assertFalse(Path(folder, "run_1.csv").exists())
 
     def test_on_azure_the_database_is_used(self):
         with patch.object(cli, "SqlLog", side_effect=RuntimeError("database used")), \
                 patch.object(cli, "load_materials", return_value=small_materials()), patch("sys.stdout"):
             with self.assertRaisesRegex(RuntimeError, "database used"):
                 self.main("show", "--run-id", "1")
-            with self.assertRaisesRegex(RuntimeError, "database used"):
-                self.main("run", env={"CONTAINER_APP_JOB_NAME": "forge-bias-scoring"})
+            with tempfile.TemporaryDirectory() as folder, patch.object(debug_log, "LOG_DIR", Path(folder)):
+                with self.assertRaisesRegex(RuntimeError, "database used"):
+                    self.main("run", env={"CONTAINER_APP_JOB_NAME": "forge-bias-scoring"})
+                self.assertEqual(list(Path(folder).iterdir()), [])  # online: no log file
 
 if __name__ == "__main__":
     unittest.main()

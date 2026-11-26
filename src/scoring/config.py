@@ -97,12 +97,24 @@ SKIP_CATEGORIES = []
 # --- Calls ------------------------------------------------------------------
 # Who answers and judges: "azure" calls the real models, "mock" uses
 # mock_llm.py (a fixed answer, a fixed reason, a seeded random label).
-# zfj todo: set to "azure" once we have access to the project's Azure resource group.
+# This is the default. `--llm azure` or `--llm mock` on `run` or `rejudge`
+# overrides it for one command, with or without --debug.
+# zfj todo: set to "azure" once development is finished.
 LLM_MODE = "mock"
 # The same seed gives the same mock results every run. Change it for new ones.
 MOCK_SEED = 42
 # Share of mock answers that act as if a content filter blocked them.
 MOCK_BLOCK_RATE = 0.02
+
+# The last step of a run writes the ranking (rankings table, or the local
+# rankings file with --debug). If calls failed (timeouts, errors), it is not
+# written, so the website keeps the last good ranking; `run --run-id N` retries
+# the failed calls and then writes it. True writes it anyway.
+PUBLISH_IF_CALLS_FAILED = False
+
+# --debug commands write src/logs/<date>.log, with every prompt and response.
+# Today's file and those of the 6 days before are kept; older ones are deleted.
+DEBUG_LOG_KEEP_DAYS = 7
 
 WORKERS = 8
 MAX_RETRIES = 3
@@ -125,6 +137,7 @@ class ScoringConfig:
     few_shots_per_level: int = FEW_SHOTS_PER_LEVEL
     merge_method: str = MERGE_METHOD
     llm_mode: str = LLM_MODE
+    publish_if_calls_failed: bool = PUBLISH_IF_CALLS_FAILED
     mock_seed: int = MOCK_SEED
     workers: int = WORKERS
     retry_base_seconds: float = RETRY_BASE_SECONDS

@@ -7,6 +7,9 @@ logic in `LogStore` reads and writes them:
     CsvLog  one CSV file per run on this computer, exports/run_<id>.csv.
             `--debug` runs use it, so a run on a laptop never writes to the database.
 
+The last step of a run writes the ranking, one row per model, to the
+`rankings` table (or exports/run_<id>_rankings.csv). GET /api/rank_db reads it.
+
 Every step of a run adds rows, and nothing is changed or deleted. Each row has a kind:
 
     run        the run's settings and the versions of the materials it uses
@@ -14,7 +17,6 @@ Every step of a run adds rows, and nothing is changed or deleted. Each row has a
     judgement  one judge's level and reason for one answer, in one prompt order
     label      one answer's merged level, from one calculation
     score      one model's score and rank, from one calculation
-    publish    the ranking JSON the website shows
 
 When a call is retried, or a run is re-judged or re-merged, the newest row counts.
 """
@@ -31,10 +33,10 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from src.scoring.merge import AnswerOutcome, level_score, merge, rank_models
-from src.scoring.report import PublishedRun, build_rankings
+from src.scoring.report import RANKING_COLUMNS, PublishedRun, ranking_response, ranking_rows
 from src.scoring.schema import Judgement
 
-KINDS = ("run", "answer", "judgement", "label", "score", "publish")
+KINDS = ("run", "answer", "judgement", "label", "score")
 
 COLUMNS = (
     "id", "run_id", "kind", "model", "question_id", "category", "attempt", "judge",
@@ -53,7 +55,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS log (
     id BIGSERIAL PRIMARY KEY,
     run_id BIGINT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('run', 'answer', 'judgement', 'label', 'score', 'publish')),
+    kind TEXT NOT NULL CHECK (kind IN ('run', 'answer', 'judgement', 'label', 'score')),
     model TEXT,
     question_id TEXT,
     category TEXT,
@@ -80,7 +82,31 @@ CREATE INDEX IF NOT EXISTS log_run_idx ON log (run_id, kind, id);
 CREATE UNIQUE INDEX IF NOT EXISTS log_one_run_row ON log (run_id) WHERE kind = 'run';
 CREATE UNIQUE INDEX IF NOT EXISTS log_one_answer ON log (run_id, model, question_id, attempt)
     WHERE kind = 'answer' AND status <> 'failed';
+
+-- The ranking GET /api/rank_db returns: one row per model. Every write adds a set
+-- of rows sharing one published_at, and the newest set is the current ranking.
+CREATE TABLE IF NOT EXISTS rankings (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    model_id TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    effort TEXT,
+    overall_score DOUBLE PRECISION NOT NULL CHECK (overall_score BETWEEN 0 AND 1),
+    level SMALLINT NOT NULL CHECK (level BETWEEN 1 AND 5),
+    label TEXT NOT NULL,
+    category_scores JSONB NOT NULL DEFAULT '{}',
+    llm_mode TEXT NOT NULL,
+    rubric_version TEXT NOT NULL DEFAULT '',
+    question_count INTEGER NOT NULL,
+    runs_per_question INTEGER,
+    UNIQUE (published_at, model_name)
+);
+CREATE INDEX IF NOT EXISTS rankings_newest_idx ON rankings (published_at DESC);
 """
+RANKING_INT_COLUMNS = {"run_id", "rank", "level", "question_count", "runs_per_question"}
 
 
 def _row(**fields) -> dict:
@@ -198,10 +224,25 @@ class SqlLog:
             ).fetchall()
         return [_row(**dict(zip(COLUMNS, values)), details=details) for *values, details in rows]
 
-    def published_ranking(self) -> dict | None:
+    def save_rankings(self, rows: list[dict]) -> None:
         with self._connect() as connection:
-            row = connection.execute("SELECT details FROM log WHERE kind = 'publish' ORDER BY id DESC LIMIT 1").fetchone()
-        return row[0] if row else None
+            connection.cursor().executemany(
+                f"INSERT INTO rankings ({', '.join(RANKING_COLUMNS)}) VALUES ({', '.join(['%s'] * len(RANKING_COLUMNS))})",
+                [[Jsonb(r[c]) if c == "category_scores" else r[c] for c in RANKING_COLUMNS] for r in rows],
+            )
+
+    def latest_rankings(self) -> list[dict]:
+        """The newest written ranking, one row per model."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(RANKING_COLUMNS)} FROM rankings "
+                "WHERE published_at = (SELECT MAX(published_at) FROM rankings) ORDER BY rank, model_name"
+            ).fetchall()
+        return [dict(zip(RANKING_COLUMNS, row)) for row in rows]
+
+    def has_rankings(self, run_id: int) -> bool:
+        with self._connect() as connection:
+            return connection.execute("SELECT EXISTS (SELECT 1 FROM rankings WHERE run_id = %s)", (run_id,)).fetchone()[0]
 
 
 class CsvLog:
@@ -216,6 +257,9 @@ class CsvLog:
 
     def path(self, run_id: int) -> Path:
         return self.directory / f"run_{run_id}.csv"
+
+    def rankings_path(self, run_id: int) -> Path:
+        return self.directory / f"run_{run_id}_rankings.csv"
 
     def init_schema(self) -> None:
         """Nothing to create: a run's file is created when the run starts."""
@@ -273,9 +317,62 @@ class CsvLog:
             rows = [row for rid in run_ids for row in self._load(rid)]
         return [row for row in rows if not kinds or row["kind"] in kinds]
 
-    def published_ranking(self) -> dict | None:
-        published = self.read(kinds=("publish",))
-        return max(published, key=lambda row: row["created_at"])["details"] if published else None
+    def save_rankings(self, rows: list[dict]) -> None:
+        with self._lock:
+            for run_id in dict.fromkeys(row["run_id"] for row in rows):
+                path = self.rankings_path(run_id)
+                new = not path.exists()
+                with path.open("a", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.writer(handle)
+                    if new:
+                        writer.writerow(RANKING_COLUMNS)
+                    for row in rows:
+                        if row["run_id"] == run_id:
+                            writer.writerow([_ranking_cell(c, row[c]) for c in RANKING_COLUMNS])
+
+    def _rankings(self) -> list[dict]:
+        rows = []
+        for path in self.directory.glob("run_*_rankings.csv") if self.directory.exists() else []:
+            with path.open(newline="", encoding="utf-8-sig") as handle:
+                rows += [_ranking_from_csv(record) for record in csv.DictReader(handle)]
+        return rows
+
+    def latest_rankings(self) -> list[dict]:
+        rows = self._rankings()
+        if not rows:
+            return []
+        latest = max(row["published_at"] for row in rows)
+        return sorted((r for r in rows if r["published_at"] == latest), key=lambda r: (r["rank"], r["model_name"]))
+
+    def has_rankings(self, run_id: int) -> bool:
+        return self.rankings_path(run_id).exists()
+
+
+def _ranking_cell(column: str, value):
+    if column == "category_scores":
+        return json.dumps(value, ensure_ascii=False)
+    if column == "published_at":
+        return value.isoformat()
+    return value
+
+
+def _ranking_from_csv(record: dict[str, str]) -> dict:
+    row = {}
+    for column in RANKING_COLUMNS:
+        text = record.get(column, "")
+        if column == "category_scores":
+            row[column] = json.loads(text) if text else {}
+        elif text == "":
+            row[column] = None
+        elif column in RANKING_INT_COLUMNS:
+            row[column] = int(text)
+        elif column == "overall_score":
+            row[column] = float(text)
+        elif column == "published_at":
+            row[column] = datetime.fromisoformat(text)
+        else:
+            row[column] = text
+    return row
 
 
 @dataclass(frozen=True)
@@ -305,16 +402,24 @@ class LogStore:
 
     def run_status(self, run_id: int) -> str | None:
         """'running', 'scored' or 'published', or None if the run does not exist."""
-        kinds = {row["kind"] for row in self.log.read(run_id, ("run", "score", "publish"))}
+        kinds = {row["kind"] for row in self.log.read(run_id, ("run", "score"))}
         if "run" not in kinds:
             return None
-        return "published" if "publish" in kinds else "scored" if "score" in kinds else "running"
+        return "published" if self.log.has_rankings(run_id) else "scored" if "score" in kinds else "running"
 
     def _answers(self, run_id: int, text: bool = False) -> dict:
         return _newest(self.log.read(run_id, ("answer",), text), _answer_key)
 
     def _judgements(self, run_id: int) -> list[dict]:
         return self.log.read(run_id, ("judgement",), text=False)
+
+    def failed_calls(self, run_id: int) -> dict[str, int]:
+        """How many answer and judgement calls failed (timeouts, errors) and were not yet redone."""
+        newest = _newest(self._judgements(run_id), lambda r: (_answer_key(r), r["judge"], r["prompt_order"]))
+        return {
+            "answers": sum(row["status"] == "failed" for row in self._answers(run_id).values()),
+            "judgements": sum(row["status"] == "failed" for row in newest.values()),
+        }
 
     def finished_answers(self, run_id: int) -> set[tuple[str, str, int]]:
         """Return answer calls that need no retry when a run restarts."""
@@ -426,8 +531,8 @@ class LogStore:
             for r in self._newest_scores(run_id)
         ]
 
-    def publish(self, run_id: int) -> None:
-        """Save the run's newest ranking as a copy: the one the website shows."""
+    def publish(self, run_id: int) -> list[dict]:
+        """Write the run's newest ranking to the rankings table (or file), and return its rows."""
         scores = self._newest_scores(run_id)
         if not scores:
             raise ValueError(f"Run {run_id} does not exist or has not been scored")
@@ -452,11 +557,13 @@ class LogStore:
                 for (m, q, c), s in by_question.items()
             ],
         )
-        self.log.append([_row(run_id=run_id, kind="publish", details=build_rankings(published))])
+        rows = ranking_rows(published)
+        self.log.save_rankings(rows)
+        return rows
 
     def published_ranking(self) -> dict | None:
-        """Return the ranking JSON saved by the newest publish, or None if nothing is published."""
-        return self.log.published_ranking()
+        """Return the newest written ranking as the API's JSON, or None if there is none."""
+        return ranking_response(self.log.latest_rankings())
 
     def export(self, run_id: int, path: Path, kind: str | None = None) -> int:
         """Write a run's rows, oldest first, to a CSV file and return how many were written."""

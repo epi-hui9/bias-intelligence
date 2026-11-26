@@ -418,9 +418,7 @@ def extract_url_api(request: UrlRequest):
     return extract_url(request)
 
 
-@app.get("/rankings")
-def rankings():
-    """Return everything the ranking website shows, from saved results. Never calls an AI model."""
+def _newest_ranking():
     try:
         ranking = LogStore(SqlLog(DATABASE_URL)).published_ranking()
     except (ValueError, psycopg.Error) as exc:
@@ -430,9 +428,22 @@ def rankings():
     return ranking
 
 
+@app.get("/api/rank_db")
+def rank_db():
+    """Return the newest ranking from the rankings table. Never runs the pipeline or calls an AI model."""
+    return _newest_ranking()
+
+
+# zfj todo: remove this api after whole rank finished. Use /api/rank_db.
+@app.get("/rankings")
+def rankings():
+    return _newest_ranking()
+
+
+# zfj todo: remove this api after whole rank finished. Use /api/rank_db.
 @app.get("/api/rankings")
 def rankings_api():
-    return rankings()
+    return _newest_ranking()
 
 
 @app.get("/{full_path:path}")

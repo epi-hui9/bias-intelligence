@@ -41,3 +41,6 @@ Thumbs.db
 
 # Scoring run exports
 exports
+
+# Debug log files
+src/logs

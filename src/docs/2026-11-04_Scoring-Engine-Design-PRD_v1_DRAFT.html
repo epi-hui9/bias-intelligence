@@ -76,7 +76,7 @@
   <tr><td>Asking, judging and retries</td><td><code>src/scoring/runner.py</code></td></tr>
   <tr><td>Results log</td><td><code>src/scoring/store.py</code></td></tr>
   <tr><td>Materials in SQL</td><td><code>src/scoring/materials_db.py</code></td></tr>
-  <tr><td>Commands</td><td><code>python -m src.scoring</code> (<code>import-materials</code>, <code>init-db</code>, <code>check</code>, <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>publish</code>, <code>export</code>)</td></tr>
+  <tr><td>Commands</td><td><code>python -m src.scoring</code> (<code>import-materials</code>, <code>init-db</code>, <code>check</code>, <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>export</code>)</td></tr>
   <tr><td>Ranking request</td><td><code>GET /api/rankings</code> in <code>src/api/fastapi_app.py</code></td></tr>
   <tr><td>Mock models (no Azure needed)</td><td><code>src/scoring/mock_llm.py</code>, switched on by <code>LLM_MODE</code></td></tr>
   <tr><td>Website payload</td><td><code>src/scoring/report.py</code></td></tr>
@@ -84,13 +84,13 @@
 </table></div>
 <p><span class="tag open">Open</span> <strong>Testing with 1 candidate (2026-11-25).</strong> While the whole project is tested, <code>CANDIDATE_MODELS</code> has only <code>gpt-5.4-mini</code>, with the other 16 commented out, and the 3 judges stay. A full run is then 183 answers and 1,647 judgements. Uncomment the 16 for a real run.</p>
 <p>2026-11-22: a full mock run (20 models, 47 human questions, 3 answers each, 23,598 judge calls) ran against a local PostgreSQL in about 10 seconds, and <code>GET /api/rankings</code> returned 200. 81 tests pass.</p>
-<p>A run ends as <code>scored</code>, and the website shows nothing from it until someone reviews it and runs <code>publish</code>.</p>
+<p><span class="tag decided">Decided</span> <strong>One pipeline (2026-11-25).</strong> <code>run</code> reads the materials, asks, judges, scores, and writes the ranking to the <code>rankings</code> table in one command. There is no review step and no separate <code>publish</code> command. <code>rejudge</code> and <code>merge</code> also write a new ranking.</p>
 <ul>
   <li><span class="tag decided">Decided</span> The result tables changed again on 2026-11-25, to one <code>log</code> table. <code>init-db</code> creates it. No real run existed, so nothing was lost.</li>
   <li><span class="tag decided">Decided</span> <strong>Mock mode (2026-11-22).</strong> Until we have access to the Azure resource group, <code>LLM_MODE = "mock"</code>. Every answer is a fixed sentence and every judge reason is the same. Each judge label is drawn at random, seeded by <code>MOCK_SEED</code>, the model and the prompt, so a run repeats exactly. About 2% of answers (<code>MOCK_BLOCK_RATE</code>) act as if a content filter blocked them. The run's settings record <code>llm_mode</code>, and the API returns it as <code>run.llmMode</code>.</li>
   <li><span class="tag open">Open</span> Checking the judges against human labels is not built, because the labels don't exist yet.</li>
   <li><span class="tag open">Open</span> Answers use temperature 0.7, so the attempts can differ, and judges use 0.</li>
-  <li><span class="tag decided">Decided</span> <strong>Done 2026-11-25, was open:</strong> re-judging or re-merging a published run changed the website right away. Publishing now saves a copy, so the website changes only when someone publishes again.</li>
+  <li><span class="tag decided">Decided</span> <strong>Done 2026-11-25, was open:</strong> re-judging or re-merging a published run changed the website right away. The ranking is now a saved copy in the <code>rankings</code> table, written at the end of each <code>run</code>, <code>rejudge</code> or <code>merge</code>.</li>
 </ul>
 
 <h2>Goal</h2>
@@ -401,7 +401,7 @@ Return JSON only:
   <tr><td><code>rubric_examples</code></td><td>One labeled example sentence, in one version</td><td><code>version</code>, <code>position</code>, <code>category</code>, <code>level</code>, <code>text</code>, <code>status</code>, <code>contributor</code>, <code>source</code></td><td>249</td></tr>
 </table></div>
 <p><span class="tag decided">Decided</span> <strong>One log table for results (2026-11-25).</strong> Fengjiao wanted fewer tables, so the six result tables (<code>runs</code>, <code>models</code>, <code>answers</code>, <code>judgements</code>, <code>answer_labels</code>, <code>model_scores</code>) are replaced by one append-only table, <code>log</code>. They had been created on Azure by mistake on 2026-11-25 and were dropped while empty. Every step of a run adds rows, and nothing is changed or deleted. <code>python -m src.scoring export --run-id N</code> writes a run's rows to a CSV file for analysis in Excel or pandas.</p>
-<svg class="d" viewBox="0 0 680 150" role="img" aria-label="A run adds rows of six kinds to one log table: run, answer, judgement, label, score and publish. Export writes them to CSV, and the ranking API reads the newest publish row.">
+<svg class="d" viewBox="0 0 680 150" role="img" aria-label="A run adds rows of five kinds to one log table: run, answer, judgement, label and score. The last step writes the rankings table, which GET /api/rank_db reads. Export writes the log to CSV.">
   <g class="g"><rect x="20" y="20" width="96" height="44" rx="8"/><text class="h" x="68" y="42">run</text></g>
   <line class="arr" x1="116" y1="42" x2="128" y2="42"/>
   <g class="p"><rect x="130" y="20" width="96" height="44" rx="8"/><text class="h" x="178" y="42">answer</text></g>
@@ -412,11 +412,12 @@ Return JSON only:
   <line class="arr" x1="446" y1="42" x2="458" y2="42"/>
   <g class="p"><rect x="460" y="20" width="96" height="44" rx="8"/><text class="h" x="508" y="42">score</text></g>
   <line class="arr" x1="556" y1="42" x2="568" y2="42"/>
-  <g class="t"><rect x="570" y="20" width="96" height="44" rx="8"/><text class="h" x="618" y="42">publish</text></g>
-  <rect class="box" x="10" y="10" width="666" height="64" rx="10"/>
-  <text x="343" y="88">all rows in one table: log</text>
+  <g class="t"><rect x="570" y="20" width="96" height="44" rx="8"/><text class="h" x="618" y="42">rankings</text></g>
+  <rect class="box" x="10" y="10" width="556" height="64" rx="10"/>
+  <text x="288" y="88">all rows in one table: log</text>
+  <text x="618" y="88">own table</text>
   <g class="g"><rect x="130" y="104" width="206" height="36" rx="8"/><text x="233" y="122">export → CSV, every kind</text></g>
-  <g class="t"><rect x="460" y="104" width="206" height="36" rx="8"/><text x="563" y="122">GET /api/rankings</text></g>
+  <g class="t"><rect x="460" y="104" width="206" height="36" rx="8"/><text x="563" y="122">GET /api/rank_db</text></g>
   <line class="arr" x1="618" y1="64" x2="618" y2="102"/>
 </svg>
 <div class="table-wrap"><table>
@@ -426,13 +427,11 @@ Return JSON only:
   <tr><td><code>judgement</code></td><td>One judge's level and reason for one answer, in one prompt order</td><td>the answer's columns, <code>judge</code>, <code>prompt_order</code>, <code>level</code>, <code>text</code> (reason); rubric and examples versions in <code>details</code></td><td>up to 26,352, plus retries and re-judging</td></tr>
   <tr><td><code>label</code></td><td>One answer's merged level, from one calculation</td><td>the answer's columns, <code>level</code>, <code>score</code>; merge method and vote count in <code>details</code></td><td>up to 3,111 per calculation</td></tr>
   <tr><td><code>score</code></td><td>One model's score and rank, from one calculation</td><td><code>model</code>, <code>score</code>; rank, answer counts, provider and effort in <code>details</code></td><td>17 per calculation</td></tr>
-  <tr><td><code>publish</code></td><td>The ranking the website shows</td><td><code>details</code> (the <code>/api/rankings</code> JSON)</td><td>1 per publish</td></tr>
 </table></div>
 <p>Columns: <code>id</code>, <code>run_id</code>, <code>kind</code>, <code>model</code>, <code>question_id</code>, <code>category</code>, <code>attempt</code>, <code>judge</code>, <code>prompt_order</code>, <code>level</code>, <code>score</code>, <code>status</code>, <code>text</code>, <code>error</code>, <code>details</code> (JSON), <code>created_at</code>. A column a kind doesn't use stays empty.</p>
 <ul>
   <li><span class="tag decided">Decided</span> The newest row counts. A retried call or a re-judging adds a row, the old one stays, and the newest successful row for each answer, judge and order is the current one.</li>
   <li><span class="tag decided">Decided</span> The database still checks what it can without links between tables: each kind must fill its columns, a run has one <code>run</code> row, and an answer can succeed only once per attempt.</li>
-  <li><span class="tag decided">Decided</span> <strong>Publishing saves a copy.</strong> <code>publish</code> stores the finished ranking JSON, and <code>/api/rankings</code> returns the newest one. Re-judging or re-merging a published run no longer changes the website until someone publishes again.</li>
   <li><span class="tag decided">Decided</span> Category scores use the category saved with each answer, not today's question file.</li>
   <li><span class="tag decided">Decided</span> Run IDs count up from 1. Every row records its time.</li>
   <li><span class="tag decided">Decided</span> The export writes one CSV per run to <code>exports/azure_run_&lt;id&gt;.csv</code>, which Git ignores. <code>--kind</code> exports one kind only. The columns are fixed: the log columns, then <code>rank</code>, <code>scored</code>, <code>blocked</code>, <code>failed</code>, <code>provider</code>, <code>effort</code>, <code>merge_method</code>, <code>judgement_count</code>, <code>rubric_version</code>, <code>examples_version</code>, and <code>details</code> as JSON for the rest, such as a run's settings.</li>
@@ -446,11 +445,36 @@ Return JSON only:
   <tr><td><code>python -m src.scoring run</code></td><td>A laptop</td><td>Nothing: it stops and says to add <code>--debug</code></td></tr>
 </table></div>
 <ul>
-  <li><span class="tag decided">Decided</span> <code>--debug</code> works on <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code>, <code>publish</code> and <code>export</code>. Materials are read from SQL either way.</li>
+  <li><span class="tag decided">Decided</span> <code>--debug</code> works on <code>run</code>, <code>rejudge</code>, <code>merge</code>, <code>show</code> and <code>export</code>. Materials are read from SQL either way.</li>
+  <li><span class="tag decided">Decided</span> <strong>Mock or real is one flag.</strong> <code>LLM_MODE</code> in the config is the default (<code>"mock"</code> for now). <code>--llm azure</code> or <code>--llm mock</code> on <code>run</code> or <code>rejudge</code> overrides it for that command, with or without <code>--debug</code>.</li>
   <li><span class="tag decided">Decided</span> The local file has the same rows and columns as the export, so the same analysis works on both. One file per run, appended as the run goes, so a stopped run continues from the file.</li>
   <li><span class="tag decided">Decided</span> A run counts as on Azure when <code>CONTAINER_APP_JOB_NAME</code> or <code>CONTAINER_APP_NAME</code> is set, which Azure sets inside Container Apps. Reading the log (<code>show</code>, <code>export</code>) works from a laptop.</li>
   <li><span class="tag open">Open</span> Check that the scoring job sets <code>CONTAINER_APP_JOB_NAME</code> once the job exists.</li>
-  <li><span class="tag decided">Decided</span> A local <code>publish</code> adds a publish row to the file only. The website reads the database, so it does not change.</li>
+  <li><span class="tag decided">Decided</span> A local run writes its ranking to <code>exports/run_&lt;id&gt;_rankings.csv</code>, with the same columns as the <code>rankings</code> table. The website reads the database, so it does not change.</li>
+</ul>
+<h3>Debug log file <span class="tag decided">Decided</span></h3>
+<p><span class="tag decided">Decided</span> <strong>2026-11-25.</strong> The backend had no logging, only <code>print()</code>. A <code>--debug</code> command now also writes <code>src/logs/&lt;date&gt;.log</code>, one file per day, which Git and Docker ignore. Online, without <code>--debug</code>, no log file is written.</p>
+<ul>
+  <li><span class="tag decided">Decided</span> It holds the command, the run ID, every model call (number, answer or judge, model, <code>max_tokens</code>, temperature, time taken, <strong>the full prompt</strong> and the response), failed and blocked calls with their error, and the ranking.</li>
+  <li><span class="tag decided">Decided</span> When a <code>--debug</code> command starts, it deletes log files older than <code>DEBUG_LOG_KEEP_DAYS</code> (7): today's file and the 6 days before it are kept.</li>
+  <li>About 70 KB per question, so a 61-question run with 1 model is about 4 MB. The code is in <code>src/scoring/debug_log.py</code>.</li>
+</ul>
+<h3>Rankings table and <code>/api/rank_db</code> <span class="tag decided">Decided</span></h3>
+<p><span class="tag decided">Decided</span> <strong>2026-11-25.</strong> The last step of the pipeline writes one row per model to <code>rankings</code>. <code>GET /api/rank_db</code> only reads the newest set of rows and returns Zeli's <code>RankingResponse</code>. It never runs the pipeline or calls a model.</p>
+<div class="table-wrap"><table>
+  <tr><th>Column</th><th>Meaning</th></tr>
+  <tr><td><code>id</code></td><td>Row key</td></tr>
+  <tr><td><code>run_id</code>, <code>published_at</code></td><td>Which run, and when this ranking was written. One write shares one <code>published_at</code>.</td></tr>
+  <tr><td><code>rank</code></td><td>1 is the most biased. Equal scores share a rank.</td></tr>
+  <tr><td><code>model_id</code>, <code>model_name</code>, <code>provider</code>, <code>effort</code></td><td>The model, such as <code>gpt-5-4-mini</code>, <code>gpt-5.4-mini</code>, OpenAI; <code>effort</code> is empty for the provider default</td></tr>
+  <tr><td><code>overall_score</code>, <code>level</code>, <code>label</code></td><td>0 to 1, then the nearest level 1 to 5 and its name</td></tr>
+  <tr><td><code>category_scores</code></td><td>JSON, such as <code>{"gender": 0.5}</code></td></tr>
+  <tr><td><code>llm_mode</code>, <code>rubric_version</code>, <code>question_count</code>, <code>runs_per_question</code></td><td>About the run: <code>mock</code> or <code>azure</code>, the rubric it was judged with, its size</td></tr>
+</table></div>
+<ul>
+  <li><span class="tag decided">Decided</span> Nothing is overwritten. A new write adds rows, and the API returns the newest <code>published_at</code>.</li>
+  <li><span class="tag decided">Decided</span> The ranking is not written when calls failed (timeouts or errors; refusals and filter blocks don't count), so the website keeps the last good ranking. <code>run --run-id N</code> retries only the failed calls, then writes it. <code>PUBLISH_IF_CALLS_FAILED = True</code> in the config writes it anyway.</li>
+  <li><span class="tag decided">Decided</span> <code>/rankings</code> and <code>/api/rankings</code> stay for now and return the same as <code>/api/rank_db</code>. They are marked <code># zfj todo</code> to remove once the whole ranking work is finished.</li>
 </ul>
 
 <h2>Open questions</h2>

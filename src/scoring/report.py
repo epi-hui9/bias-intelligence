@@ -1,4 +1,6 @@
-"""Build the JSON that GET /api/rankings returns: one result per model, no answers or judgements.
+"""Build the ranking: one row per model for the rankings table, and the JSON GET /api/rank_db returns.
+
+No answers or judgements are included.
 
 The shape follows Zeli's Website API Contract (RankingResponse). Category
 scores group question scores by the category saved with each answer.
@@ -15,7 +17,7 @@ from src.scoring.schema import LEVELS
 
 @dataclass(frozen=True)
 class PublishedRun:
-    """What the website's ranking needs from one scored run."""
+    """What the ranking needs from one scored run."""
 
     run_id: int
     settings: dict
@@ -35,40 +37,75 @@ def score_level(score: float) -> int:
     return int(score * (len(LEVELS) - 1) + 0.5) + 1
 
 
-def build_rankings(run: PublishedRun) -> dict:
+# The columns of the rankings table, one row per model.
+RANKING_COLUMNS = (
+    "run_id", "published_at", "rank", "model_id", "model_name", "provider", "effort", "overall_score",
+    "level", "label", "category_scores", "llm_mode", "rubric_version", "question_count", "runs_per_question",
+)
+
+
+def ranking_rows(run: PublishedRun) -> list[dict]:
+    """One row per model, with everything GET /api/rank_db returns."""
     by_category = defaultdict(lambda: defaultdict(list))
     for row in run.question_scores:
         if row["category"]:
             by_category[row["model"]][slug(row["category"], "_")].append(row["score"])
 
-    models = []
+    rows = []
     for row in run.scores:
         overall = round(row["score"], 4)
         level = score_level(overall)
-        models.append(
+        rows.append(
             {
+                "run_id": run.run_id,
+                "published_at": run.published_at,
                 "rank": row["rank"],
-                "modelId": slug(row["model"], "-"),
-                "modelName": row["model"],
+                "model_id": slug(row["model"], "-"),
+                "model_name": row["model"],
                 "provider": row["provider"],
                 "effort": None if row["effort"] == "default" else row["effort"],
-                "overallScore": overall,
+                "overall_score": overall,
                 "level": level,
                 "label": LEVELS[level - 1],
-                "categoryScores": {key: round(mean(scores), 4) for key, scores in by_category[row["model"]].items()},
+                "category_scores": {key: round(mean(s), 4) for key, s in by_category[row["model"]].items()},
+                # "mock" means the results are not from real models.
+                "llm_mode": run.settings.get("llm_mode", "azure"),
+                "rubric_version": ", ".join(run.rubric_versions),
+                "question_count": len({q["question_id"] for q in run.question_scores}),
+                "runs_per_question": run.settings.get("n_answers"),
             }
         )
+    return rows
 
+
+def ranking_response(rows: list[dict]) -> dict | None:
+    """Turn one written ranking back into the API's JSON (Zeli's RankingResponse), or None if empty."""
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda r: (r["rank"], r["model_name"]))
+    first = rows[0]
     return {
         "run": {
-            "runId": str(run.run_id),
-            "runDate": run.published_at.isoformat() if run.published_at else None,
-            # "mock" means the results are not from real models.
-            "llmMode": run.settings.get("llm_mode", "azure"),
-            "rubricVersion": ", ".join(run.rubric_versions),
-            "modelCount": len(models),
-            "questionCount": len({row["question_id"] for row in run.question_scores}),
-            "runsPerQuestion": run.settings.get("n_answers"),
+            "runId": str(first["run_id"]),
+            "runDate": first["published_at"].isoformat(),
+            "llmMode": first["llm_mode"],
+            "rubricVersion": first["rubric_version"],
+            "modelCount": len(rows),
+            "questionCount": first["question_count"],
+            "runsPerQuestion": first["runs_per_question"],
         },
-        "models": models,
+        "models": [
+            {
+                "rank": r["rank"],
+                "modelId": r["model_id"],
+                "modelName": r["model_name"],
+                "provider": r["provider"],
+                "effort": r["effort"],
+                "overallScore": r["overall_score"],
+                "level": r["level"],
+                "label": r["label"],
+                "categoryScores": r["category_scores"],
+            }
+            for r in rows
+        ],
     }

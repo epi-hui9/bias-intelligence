@@ -79,3 +79,6 @@ gss_questions.json
 
 # Scoring run exports (python -m src.scoring export)
 exports/
+
+# Debug log files (python -m src.scoring ... --debug)
+src/logs/
