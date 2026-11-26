@@ -435,10 +435,12 @@ class LogStore:
         answer_text: str | None = None,
         error: str | None = None,
         category: str | None = None,
+        call_settings: dict | None = None,
     ) -> None:
         self.log.append([_row(
             run_id=run_id, kind="answer", model=model_name, question_id=question_id, category=category,
             attempt=attempt, status=status, text=answer_text, error=error,
+            details={"call_settings": call_settings} if call_settings else {},
         )])
 
     def answers_to_judge(self, run_id: int) -> list[AnswerToJudge]:
@@ -466,12 +468,15 @@ class LogStore:
         level: str | None = None,
         reason: str | None = None,
         error: str | None = None,
+        call_settings: dict | None = None,
     ) -> None:
+        details = {"rubric_version": rubric_version, "examples_version": examples_version}
+        if call_settings:
+            details["call_settings"] = call_settings
         self.log.append([_row(
             run_id=run_id, kind="judgement", model=answer.model_name, question_id=answer.question_id,
             category=answer.category, attempt=answer.attempt, judge=judge, prompt_order=prompt_order,
-            level=level, status=status, text=reason, error=error,
-            details={"rubric_version": rubric_version, "examples_version": examples_version},
+            level=level, status=status, text=reason, error=error, details=details,
         )])
 
     def calculate(self, run_id: int, merge_method: str, judges, orders) -> None:

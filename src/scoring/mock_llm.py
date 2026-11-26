@@ -1,6 +1,6 @@
 """A stand-in for the Azure models, so the engine and the API can be tested without access.
 
-It has the same signature as `runner.azure_complete`. Answers are a fixed
+It takes the same arguments as `runner.azure_complete` and returns plain text. Answers are a fixed
 sentence, every judge reason is the same, and each judge label is drawn at
 random. The random draw is seeded by MOCK_SEED, the model and the prompt, so the
 same run gives the same results every time.

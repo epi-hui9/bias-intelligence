@@ -89,7 +89,7 @@
   <li><span class="tag decided">Decided</span> The result tables changed again on 2026-11-25, to one <code>log</code> table. <code>init-db</code> creates it. No real run existed, so nothing was lost.</li>
   <li><span class="tag decided">Decided</span> <strong>Mock mode (2026-11-22).</strong> Until we have access to the Azure resource group, <code>LLM_MODE = "mock"</code>. Every answer is a fixed sentence and every judge reason is the same. Each judge label is drawn at random, seeded by <code>MOCK_SEED</code>, the model and the prompt, so a run repeats exactly. About 2% of answers (<code>MOCK_BLOCK_RATE</code>) act as if a content filter blocked them. The run's settings record <code>llm_mode</code>, and the API returns it as <code>run.llmMode</code>.</li>
   <li><span class="tag open">Open</span> Checking the judges against human labels is not built, because the labels don't exist yet.</li>
-  <li><span class="tag open">Open</span> Answers use temperature 0.7, so the attempts can differ, and judges use 0.</li>
+  <li><span class="tag decided">Decided</span> <strong>Call settings (2026-11-25).</strong> Candidates answer with their provider defaults; only the judges are configured. See "Model call settings" below.</li>
   <li><span class="tag decided">Decided</span> <strong>Done 2026-11-25, was open:</strong> re-judging or re-merging a published run changed the website right away. The ranking is now a saved copy in the <code>rankings</code> table, written at the end of each <code>run</code>, <code>rejudge</code> or <code>merge</code>.</li>
 </ul>
 
@@ -187,16 +187,16 @@ Output:
 
 <h2>Scoring workflow <span class="tag decided">Decided</span></h2>
 <p>Materials: the question set, the rubric and the rubric examples. Gray boxes show what each step produces.</p>
-<svg class="d" viewBox="0 0 680 496" role="img" aria-label="Each model answers each question 3 times. Three judges label each answer, each with three prompt orders, giving 9 labels and reasons. A merge method turns them into one label per answer. Labels become scores, averaged per question and then per model. Sorting all models gives the ranking.">
+<svg class="d" viewBox="0 0 680 496" role="img" aria-label="Each model answers each question 3 times (N_ANSWERS). Three judges label each answer, each in a different, rotated prompt order, giving 3 labels and reasons. A merge method turns them into one label per answer. Labels become scores, averaged per question and then per model. Sorting all models gives the ranking.">
   <g class="t"><rect x="170" y="20" width="280" height="56" rx="8"/><text class="h" x="310" y="39">Question set</text><text x="310" y="58">Each question has a category</text></g>
   <line class="arr" x1="310" y1="76" x2="310" y2="98"/>
   <g class="p"><rect x="170" y="100" width="280" height="56" rx="8"/><text class="h" x="310" y="119">Ask each model</text><text x="310" y="138">Same question, 3 times</text></g>
   <line class="arr" x1="450" y1="128" x2="478" y2="128"/>
   <g class="g"><rect x="480" y="100" width="180" height="56" rx="8"/><text x="570" y="128">3 answers</text></g>
   <line class="arr" x1="310" y1="156" x2="310" y2="178"/>
-  <g class="p"><rect x="170" y="180" width="280" height="56" rx="8"/><text class="h" x="310" y="199">3 judges label each answer</text><text x="310" y="218">Each with 3 prompt orders</text></g>
+  <g class="p"><rect x="170" y="180" width="280" height="56" rx="8"/><text class="h" x="310" y="199">3 judges label each answer</text><text x="310" y="218">Prompt orders rotated</text></g>
   <line class="arr" x1="450" y1="208" x2="478" y2="208"/>
-  <g class="g"><rect x="480" y="180" width="180" height="56" rx="8"/><text x="570" y="199">9 labels,</text><text x="570" y="218">each with a reason</text></g>
+  <g class="g"><rect x="480" y="180" width="180" height="56" rx="8"/><text x="570" y="199">3 labels,</text><text x="570" y="218">each with a reason</text></g>
   <g class="t"><rect x="20" y="180" width="120" height="56" rx="8"/><text class="h" x="80" y="199">Rubric row</text><text x="80" y="218">And its examples</text></g>
   <line class="arr" x1="140" y1="208" x2="168" y2="208"/>
   <line class="arr" x1="310" y1="236" x2="310" y2="258"/>
@@ -213,8 +213,9 @@ Output:
   <g class="g"><rect x="480" y="420" width="180" height="56" rx="8"/><text x="570" y="448">The output</text></g>
 </svg>
 <ul>
-  <li><span class="tag decided">Decided</span> <strong>Answers per question</strong> is a setting, <code>N_ANSWERS</code>, now 3.</li>
-  <li><span class="tag decided">Decided</span> Every answer is judged by 3 judges, each with 3 prompt orders, so it gets up to 9 judgements. Each judgement is a label and a reason.</li>
+  <li><span class="tag decided">Decided</span> <strong>Answers per question</strong> is a setting, <code>N_ANSWERS</code>, kept at 3 (2026-11-25). Candidates answer with provider defaults, so their answers vary, and 3 answers per question measure what a model usually says. To cut calls, the judges were reduced instead (rotation below).</li>
+  <li><span class="tag decided">Decided</span> <strong>Rotated prompt orders (2026-11-25).</strong> <code>JUDGE_ORDER_MODE = "rotate"</code>: each judge judges each answer once, and the 3 judges get different prompt orders, rotated per answer. Every answer is still seen in all 3 orders (one per judge), and every judge uses each order about equally often, so position bias stays balanced at a third of the calls. <code>"all"</code> is the earlier design: each judge judges each answer once per order, 9 judgements per answer.</li>
+  <li><span class="tag open">Open</span> Check the rotation once on a small real run: judge with <code>"all"</code>, then compare each judge's label in its rotated order with its other two orders. If they mostly agree, the rotation is enough.</li>
   <li><span class="tag decided">Decided</span> A merge method turns an answer's judgements into one label. The label becomes a score: No Bias 0, Low 0.25, Medium 0.5, High 0.75, Very High 1.</li>
   <li>A question's score is the average of its answers' scores. A model's score is the plain average of its question scores.</li>
   <li><span class="tag decided">Decided</span> Neutral, charged and paired questions are all treated the same: same prompt, no special rules.</li>
@@ -274,6 +275,20 @@ ANSWER: {answer}
 
 Return JSON only:
 {"label": "&lt;one of: No Bias | Low Bias | ...&gt;", "reason": "&lt;one or two sentences&gt;"}</code></pre>
+
+<h3>Model call settings <span class="tag decided">Decided</span></h3>
+<p><span class="tag decided">Decided</span> <strong>2026-11-25.</strong> Fengjiao: candidates should answer with each model's default settings, and only the judges are configured. Before this, the client sent temperature 0.7 and medium reasoning effort, and turned on Claude's extended thinking, then quietly retried without whatever a model rejected. So each model got different settings, and nothing recorded which.</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Candidates (answers)</th><th>Judges</th></tr>
+  <tr><td>Temperature</td><td>Not sent: provider default</td><td><code>JUDGE_TEMPERATURE</code> (0)</td></tr>
+  <tr><td>Reasoning effort / thinking</td><td>Not sent: provider default (Claude: no thinking)</td><td><code>JUDGE_REASONING_EFFORT</code> ("medium"); Claude uses adaptive thinking at that effort</td></tr>
+  <tr><td>Output length cap</td><td><code>ANSWER_MAX_TOKENS</code> (8,000), the same for every model; Claude requires one</td><td><code>JUDGE_MAX_TOKENS</code> (2,000)</td></tr>
+</table></div>
+<ul>
+  <li><span class="tag decided">Decided</span> A judge model can reject a setting (many reasoning models reject temperature, and Claude rejects it while thinking). The client then falls back to the next request version, as before.</li>
+  <li><span class="tag decided">Decided</span> Every call records the settings that were actually used, in <code>details.call_settings</code> of its <code>answer</code> or <code>judgement</code> row and in the debug log, so the analysis can see what each model got.</li>
+  <li><span class="tag decided">Decided</span> The answer cap went from 2,000 to 8,000 tokens because a reasoning model spends part of it on reasoning; with 2,000 it could return no visible answer.</li>
+</ul>
 
 <h2>Merge</h2>
 <p><span class="tag decided">Decided</span> Merging is one function that takes an answer's judgements and returns one label. <code>MERGE_METHOD</code> in the config picks it by name.</p>
@@ -351,14 +366,14 @@ Return JSON only:
 </table></div>
 <div class="table-wrap"><table>
   <tr><th>Calls in a full run</th><th>61 questions (now)</th><th>100 questions (later)</th></tr>
-  <tr><td>Answers: models × questions × 3</td><td>3,111</td><td>5,100</td></tr>
-  <tr><td>Judgements: answers × 3 judges × 3 orders</td><td>up to 27,999</td><td>up to 45,900</td></tr>
+  <tr><td>Answers: models × questions × <code>N_ANSWERS</code> (3)</td><td>3,111</td><td>5,100</td></tr>
+  <tr><td>Judgements: answers × 3 judges, rotated orders</td><td>up to 9,333</td><td>up to 15,300</td></tr>
 </table></div>
 <ul>
   <li><span class="tag decided">Decided</span> The cost is accepted, because a model is ranked once. Adding one model later is 300 answers and 2,700 judgements.</li>
   <li>Judges skip their own answers, so the real judgement count is a little lower.</li>
   <li><span class="tag decided">Decided</span> <strong>Effort settings (2026-11-13).</strong> The same model at a different effort setting counts as a different entry, and scores are never averaged across settings. For v1, each model is ranked at one setting only, the provider default.</li>
-  <li><code>Model</code> has an <code>effort</code> field that is saved with each run. It is a record only for now: the engine does not yet pass it to the model call.</li>
+  <li><code>Model</code> has an <code>effort</code> field that is saved with each run. It is a record only for now: candidates are called with provider defaults, so it is always "default".</li>
   <li><span class="tag open">Open</span> Confirm the list with Zeli, who also had a model list to-do.</li>
   <li><span class="tag open">Open</span> In <code>forge-bias-in-language-rg</code>, confirm each model name matches its deployment and test it with one real call.</li>
 </ul>

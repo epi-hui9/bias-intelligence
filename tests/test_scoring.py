@@ -8,7 +8,8 @@ from datetime import date, timedelta
 from pathlib import Path
 import unittest
 from dataclasses import replace
-from collections import Counter
+from collections import Counter, defaultdict
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import psycopg
@@ -16,9 +17,12 @@ from fastapi.testclient import TestClient
 
 from src.api import fastapi_app
 from src.api.fastapi_app import app
-from src.llm.azure_openai_client import ModelCompletionError
+from src.llm.azure_openai_client import CompletionResult, ModelCompletionError, create_completion
 from src.scoring import mock_llm, runner
-from src.scoring.config import CANDIDATE_MODELS, JUDGE_MODELS, LETTERED_ORDER, ScoringConfig
+from src.scoring.config import (
+    ANSWER_MAX_TOKENS, CANDIDATE_MODELS, JUDGE_MAX_TOKENS, JUDGE_MODELS, JUDGE_REASONING_EFFORT, JUDGE_TEMPERATURE,
+    LETTERED_ORDER, ScoringConfig,
+)
 from src.scoring.judge import build_prompt, parse_judgement
 from src.scoring.loaders import import_from_disk, load_from_disk, load_from_sql, load_materials, prepare
 from src.scoring.merge import AnswerOutcome, merge, rank_models
@@ -234,6 +238,45 @@ class RetryTests(unittest.TestCase):
                     runner.azure_complete("gpt-5.5", "prompt", 10, 0.0, None)
 
 
+class CallSettingsTests(unittest.TestCase):
+    def test_azure_complete_uses_defaults_for_answers_and_config_for_judges(self):
+        with patch.object(runner, "openai_client"), patch.object(runner, "create_completion") as create:
+            runner.azure_complete("cand", "prompt", 8000, None, None)
+            runner.azure_complete("judge", "prompt", 2000, 0.0, {"type": "object"})
+        answer, judge = (c.kwargs for c in create.call_args_list)
+        self.assertTrue(answer["provider_defaults"])
+        self.assertFalse(judge["provider_defaults"])
+        self.assertEqual((judge["temperature"], judge["reasoning_effort"]), (0.0, JUDGE_REASONING_EFFORT))
+
+    def openai_payloads(self, **kwargs):
+        sent = []
+        response = SimpleNamespace(output_text="hi", temperature=1.0, top_p=1.0, reasoning=SimpleNamespace(effort="medium"))
+        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **payload: sent.append(payload) or response))
+        result = create_completion(client, "prompt", model="gpt-x", **kwargs)
+        return sent, result
+
+    def test_provider_defaults_send_no_temperature_or_effort(self):
+        sent, result = self.openai_payloads(max_tokens=8000, provider_defaults=True)
+        self.assertEqual(sent, [{"model": "gpt-x", "input": [{"role": "user", "content": "prompt"}], "max_output_tokens": 8000}])
+        # The API reports the defaults it used, and they are recorded.
+        self.assertEqual(result.settings, {"api": "responses", "max_output_tokens": 8000,
+                                           "reported": {"temperature": 1.0, "top_p": 1.0, "reasoning_effort": "medium"}})
+
+    def test_judge_settings_are_sent(self):
+        sent, result = self.openai_payloads(max_tokens=2000, temperature=0.0, reasoning_effort="high")
+        self.assertEqual((sent[0]["temperature"], sent[0]["reasoning"]["effort"]), (0.0, "high"))
+        self.assertEqual(result.settings["temperature"], 0.0)
+
+    def test_claude_with_provider_defaults_has_no_thinking(self):
+        sent = []
+        message = SimpleNamespace(content=[SimpleNamespace(type="text", text="hi")], stop_reason="end_turn")
+        fake = SimpleNamespace(messages=SimpleNamespace(create=lambda **payload: sent.append(payload) or message))
+        with patch("src.llm.azure_openai_client.anthropic_client", return_value=fake):
+            result = create_completion(None, "prompt", model="claude-x", max_tokens=8000, provider_defaults=True)
+        self.assertEqual(sent, [{"model": "claude-x", "messages": [{"role": "user", "content": "prompt"}], "max_tokens": 8000}])
+        self.assertEqual(result.settings, {"api": "anthropic", "max_tokens": 8000})
+
+
 class RankingsRouteWithoutDatabaseTests(unittest.TestCase):
     def test_missing_database_setting_returns_503(self):
         with patch.object(fastapi_app, "DATABASE_URL", None):
@@ -318,8 +361,10 @@ class EngineTests:
         self.store = self.make_store()
         self.models = [Model("gpt-5.5", "OpenAI"), Model("model-b", "B"), Model("model-c", "C")]
         self.materials = small_materials()
+        # "all" orders: 9 judge calls per answer, so every order is tested.
         self.config = ScoringConfig(
-            judge_models=("gpt-5.5", "judge-b", "judge-c"), models=tuple(self.models), workers=4, retry_base_seconds=0
+            judge_models=("gpt-5.5", "judge-b", "judge-c"), models=tuple(self.models), workers=4, retry_base_seconds=0,
+            n_answers=3, judge_order_mode="all",
         )
         self.levels = {"gpt-5.5": "Medium Bias", "model-b": "High Bias", "model-c": "Low Bias"}
         self.judge_calls = []
@@ -523,6 +568,41 @@ class EngineTests:
         self.assertEqual(self.store.run_status(run_id), "running")
         self.assertIsNone(self.store.run_status(run_id + 1))
 
+    def test_rotation_gives_each_judge_one_call_and_each_answer_all_orders(self):
+        run_id = self.run_engine(config=replace(self.config, judge_order_mode="rotate"))
+        judgements = self.rows("judgement")
+        # 18 answers x 3 judges, minus gpt-5.5 skipping its own 6 answers.
+        self.assertEqual(len(judgements), 18 * 3 - 6)
+        by_answer = defaultdict(list)
+        for row in judgements:
+            by_answer[(row["model"], row["question_id"], row["attempt"])].append(row["prompt_order"])
+        for key, orders in by_answer.items():
+            self.assertEqual(len(orders), len(set(orders)), key)  # one order per judge, all different
+            self.assertEqual(len(orders), 2 if key[0] == "gpt-5.5" else 3)
+        for judge in ("gpt-5.5", "judge-b", "judge-c"):
+            self.assertEqual({r["prompt_order"] for r in judgements if r["judge"] == judge},
+                             {"ascending", "descending", "lettered"})
+        self.assertEqual([r["model"] for r in self.store.run_rankings(run_id)], ["model-b", "gpt-5.5", "model-c"])
+
+    def test_candidates_get_provider_defaults_and_judges_the_config(self):
+        asked = []
+        def complete(model, prompt, max_tokens, temperature, schema):
+            asked.append(("judge" if schema else "answer", temperature, max_tokens))
+            if schema is None:
+                return CompletionResult(text="An answer", settings={"api": "responses", "max_output_tokens": max_tokens})
+            label = schema["properties"]["label"]["enum"][0]
+            return CompletionResult(text=json.dumps({"label": label, "reason": "r"}),
+                                    settings={"api": "responses", "temperature": 0.0})
+        config = replace(self.config, models=(Model("model-b", "B"),), n_answers=1, judge_order_mode="rotate")
+        run_id = self.store.create_run("q#1", config.snapshot())
+        ask_models(self.store, run_id, list(config.models), self.materials, config, complete=complete)
+        judge_answers(self.store, run_id, self.materials, config, complete=complete)
+        self.assertEqual({a for a in asked if a[0] == "answer"}, {("answer", None, ANSWER_MAX_TOKENS)})
+        self.assertEqual({a for a in asked if a[0] == "judge"}, {("judge", JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS)})
+        # The settings each call really used are saved with its row.
+        self.assertEqual(self.rows("answer")[0]["details"]["call_settings"], {"api": "responses", "max_output_tokens": 8000})
+        self.assertEqual(self.rows("judgement")[0]["details"]["call_settings"], {"api": "responses", "temperature": 0.0})
+
     def test_run_ids_count_up(self):
         self.assertEqual([self.store.create_run("q#1") for _ in range(3)], [1, 2, 3])
 
@@ -663,7 +743,7 @@ class FinishTests(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.store = LogStore(CsvLog(Path(self.folder.name)))
         self.config = ScoringConfig(models=(Model("m", "P"),), judge_models=("j1", "j2", "j3"), workers=2,
-                                    retry_base_seconds=0)
+                                    retry_base_seconds=0, n_answers=3, judge_order_mode="all")
         self.materials = small_materials()
 
     def run_with(self, fail_judge=None):
@@ -692,6 +772,14 @@ class FinishTests(unittest.TestCase):
             self.assertIsNone(self.store.published_ranking())
             self.assertTrue(cli._finish(self.store, run_id, replace(self.config, publish_if_calls_failed=True)))
         self.assertIsNotNone(self.store.published_ranking())
+
+
+def setUpModule():
+    # Any test that forgets to redirect the debug log writes here, not into src/logs.
+    folder = tempfile.mkdtemp()
+    patcher = patch.object(debug_log, "LOG_DIR", Path(folder) / "logs")
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 class DebugLogTests(unittest.TestCase):
@@ -773,6 +861,7 @@ class DebugFlagTests(unittest.TestCase):
     def test_llm_flag_overrides_the_config_for_one_command(self):
         with tempfile.TemporaryDirectory() as folder, \
                 patch.object(cli, "CsvLog", lambda: CsvLog(Path(folder))), \
+                patch.object(debug_log, "LOG_DIR", Path(folder) / "logs"), \
                 patch.object(cli, "openai_client", side_effect=ValueError("AZURE_API_KEY missing")), \
                 patch.object(cli, "load_materials", return_value=small_materials()), \
                 patch("sys.stderr"), patch("sys.stdout"):

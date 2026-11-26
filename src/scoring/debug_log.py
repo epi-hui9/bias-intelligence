@@ -61,10 +61,11 @@ def logged(complete: Callable) -> Callable:
     @wraps(complete)
     def call(model: str, prompt: str, max_tokens: int, temperature: float, schema: dict | None) -> str:
         number, kind = next(numbers), "judge" if schema else "answer"
-        header = f"call {number} {kind} model={model} max_tokens={max_tokens} temperature={temperature}"
+        asked = "provider defaults" if temperature is None else f"temperature={temperature}"
+        header = f"call {number} {kind} model={model} max_tokens={max_tokens} {asked}"
         started = time.monotonic()
         try:
-            text = complete(model, prompt, max_tokens, temperature, schema)
+            result = complete(model, prompt, max_tokens, temperature, schema)
         except (BlockedError, RefusedError) as exc:
             logger.warning("%s %s after %.2fs: %s\n--- prompt ---\n%s\n", header, type(exc).__name__,
                            time.monotonic() - started, exc, prompt)
@@ -72,7 +73,10 @@ def logged(complete: Callable) -> Callable:
         except Exception:
             logger.exception("%s failed after %.2fs\n--- prompt ---\n%s\n", header, time.monotonic() - started, prompt)
             raise
-        logger.info("%s %.2fs\n--- prompt ---\n%s\n--- response ---\n%s\n", header, time.monotonic() - started, prompt, text)
-        return text
+        text = result if isinstance(result, str) else result.text
+        used = "" if isinstance(result, str) else f"\n--- settings used ---\n{getattr(result, 'settings', {})}"
+        logger.info("%s %.2fs\n--- prompt ---\n%s\n--- response ---\n%s%s\n", header, time.monotonic() - started,
+                    prompt, text, used)
+        return result
 
     return call

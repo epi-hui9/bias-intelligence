@@ -58,6 +58,12 @@ JUDGE_MODELS = ["gpt-5.5", "claude-opus-5-5", "DeepSeek-V4-Pro"]
 JUDGE_ORDERS = ["ascending", "descending", "lettered"]
 LETTERED_ORDER = ["Medium Bias", "No Bias", "Very High Bias", "Low Bias", "High Bias"]
 
+# "rotate": each judge judges each answer once, and the judges get different
+# orders, rotated per answer, so every answer is still seen in all 3 orders and
+# every judge uses each order about equally often. 3 judge calls per answer.
+# "all": each judge judges each answer once per order. 9 judge calls per answer.
+JUDGE_ORDER_MODE = "rotate"
+
 # When a judge is also a ranked model, it does not judge its own answers.
 EXCLUDE_SELF_JUDGING = True
 
@@ -119,10 +125,17 @@ DEBUG_LOG_KEEP_DAYS = 7
 WORKERS = 8
 MAX_RETRIES = 3
 RETRY_BASE_SECONDS = 2.0
-ANSWER_MAX_TOKENS = 2000
-ANSWER_TEMPERATURE = 0.7
+# Candidates answer with their provider's default settings: no temperature,
+# reasoning effort or thinking is sent. Only this length cap is, the same for
+# every model (Claude requires one). It is large because a reasoning model
+# spends part of it on reasoning.
+ANSWER_MAX_TOKENS = 8000
+# Judges are configured. A judge model that rejects a setting (many reasoning
+# models reject temperature) is retried without it; every call records the
+# settings it really used.
 JUDGE_MAX_TOKENS = 2000
 JUDGE_TEMPERATURE = 0.0
+JUDGE_REASONING_EFFORT = "medium"
 
 
 @dataclass(frozen=True)
@@ -132,6 +145,7 @@ class ScoringConfig:
     n_answers: int = N_ANSWERS
     judge_models: tuple[str, ...] = tuple(JUDGE_MODELS)
     judge_orders: tuple[str, ...] = tuple(JUDGE_ORDERS)
+    judge_order_mode: str = JUDGE_ORDER_MODE
     lettered_order: tuple[str, ...] = tuple(LETTERED_ORDER)
     exclude_self_judging: bool = EXCLUDE_SELF_JUDGING
     few_shots_per_level: int = FEW_SHOTS_PER_LEVEL
@@ -149,6 +163,7 @@ class ScoringConfig:
             "n_answers": self.n_answers,
             "judge_models": list(self.judge_models),
             "judge_orders": list(self.judge_orders),
+            "judge_order_mode": self.judge_order_mode,
             "lettered_order": list(self.lettered_order),
             "exclude_self_judging": self.exclude_self_judging,
             "few_shots_per_level": self.few_shots_per_level,

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
@@ -32,6 +32,30 @@ class CompletionResult:
 
     text: str
     thinking: str | None = None
+    # The request settings that worked, e.g. {"api": "responses", "temperature": 0.0}.
+    settings: dict = field(default_factory=dict)
+
+
+def _reported_settings(response: Any) -> dict[str, Any]:
+    """The settings the Responses API says it used, including defaults we did not send."""
+    reported = {}
+    for name in ("temperature", "top_p"):
+        value = getattr(response, name, None)
+        if isinstance(value, (int, float)):
+            reported[name] = value
+    effort = getattr(getattr(response, "reasoning", None), "effort", None)
+    if isinstance(effort, str):
+        reported["reasoning_effort"] = effort
+    return {"reported": reported} if reported else {}
+
+
+def _used_settings(api: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """The settings of the request version that worked, without the prompt."""
+    settings = {"api": api}
+    settings.update({k: v for k, v in payload.items() if k not in ("model", "messages", "input", "text")})
+    if "text" in payload:
+        settings["json_schema"] = True
+    return settings
 
 
 def openai_client():
@@ -208,7 +232,14 @@ def create_completion(
     system_prompt: str | None = None,
     response_schema: dict[str, Any] | None = None,
     strict_json: bool = False,
+    reasoning_effort: str = "medium",
+    provider_defaults: bool = False,
 ) -> CompletionResult:
+    """Call a model. With `provider_defaults`, send no temperature, reasoning
+    effort or thinking, only the prompt and the length cap, so the model runs
+    with its provider's default settings. Otherwise try `temperature` and
+    `reasoning_effort` first, and fall back for models that reject them.
+    """
     deployment_name = resolve_model_deployment(model)
     provider = resolve_model_provider(model)
 
@@ -240,7 +271,7 @@ def create_completion(
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "thinking": {"type": "adaptive"},
-                "output_config": {"effort": "medium"},
+                "output_config": {"effort": reasoning_effort},
             },
             {
                 "model": deployment_name,
@@ -253,11 +284,16 @@ def create_completion(
             # (e.g. "`temperature` is deprecated for this model").
             {"model": deployment_name, "messages": messages, "max_tokens": max_tokens},
         ]
+        if provider_defaults:
+            # Claude requires max_tokens; everything else is left to the default (no thinking).
+            anthropic_payloads = [{"model": deployment_name, "messages": messages, "max_tokens": max_tokens}]
         anthropic_errors: list[Exception] = []
         response = None
+        used: dict[str, Any] = {}
         for payload in anthropic_payloads:
             try:
                 response = anthropic_client().messages.create(**payload)
+                used = _used_settings("anthropic", payload)
                 break
             except Exception as exc:
                 anthropic_errors.append(exc)
@@ -273,7 +309,9 @@ def create_completion(
                 "not an Azure content filter block).",
                 code="model_refusal",
             )
-        return CompletionResult(text=_anthropic_text(response), thinking=_anthropic_thinking_text(response))
+        return CompletionResult(
+            text=_anthropic_text(response), thinking=_anthropic_thinking_text(response), settings=used
+        )
 
     messages = []
     if system_prompt:
@@ -293,16 +331,19 @@ def create_completion(
     # self-reported summary), then degrade through lower effort and finally
     # no `reasoning` field at all for deployments/models that reject it.
     reasoning_tiers: list[dict[str, str] | None] = [
-        {"effort": "medium", "summary": "auto"},
-        {"effort": "medium"},
+        {"effort": reasoning_effort, "summary": "auto"},
+        {"effort": reasoning_effort},
         {"effort": "low"},
         None,
     ]
+    temperature_options = (True, False)
+    if provider_defaults:
+        reasoning_tiers, temperature_options = [None], (False,)
 
     def _build_response_payloads(schema_format: dict[str, Any] | None) -> list[dict[str, Any]]:
         payloads = []
         for reasoning in reasoning_tiers:
-            for use_temperature in (True, False):
+            for use_temperature in temperature_options:
                 payload: dict[str, Any] = {
                     "model": deployment_name,
                     "input": messages,
@@ -341,7 +382,11 @@ def create_completion(
             response = client.responses.create(**payload)
             text = _openai_response_text(response)
             if text and text.strip():
-                return CompletionResult(text=text, thinking=_openai_reasoning_summary(response))
+                return CompletionResult(
+                    text=text,
+                    thinking=_openai_reasoning_summary(response),
+                    settings={**_used_settings("responses", payload), **_reported_settings(response)},
+                )
             # A reasoning model can exhaust its budget on reasoning alone and
             # return no visible text; treat that as a failed attempt so we
             # try the next payload/fallback instead of returning nothing.
@@ -373,13 +418,18 @@ def create_completion(
             "messages": messages,
         },
     ]
+    if provider_defaults:
+        chat_payloads = [
+            {"model": deployment_name, "messages": messages, "max_tokens": max_tokens},
+            {"model": deployment_name, "messages": messages, "max_completion_tokens": max_tokens},
+        ]
     for payload in chat_payloads:
         try:
             response = client.chat.completions.create(**payload)
             text = _openai_chat_text(response)
             if text and text.strip():
                 # Chat Completions has no reasoning-summary concept.
-                return CompletionResult(text=text, thinking=None)
+                return CompletionResult(text=text, thinking=None, settings=_used_settings("chat", payload))
             finish_reason = getattr(response.choices[0], "finish_reason", None) if getattr(response, "choices", None) else None
             chat_errors.append(
                 RuntimeError(f"Chat completion returned no usable content (finish_reason={finish_reason})")
